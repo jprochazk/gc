@@ -166,7 +166,7 @@ enum_array_type!(pub type RootHeads = [*mut RootBase; RootKind]);
 mod tests {
   use super::*;
   use std::alloc::Layout;
-  use std::cell::RefCell;
+  use std::cell::{Cell, RefCell};
   use std::mem::transmute;
 
   type DropInPlace = unsafe fn(*mut ());
@@ -226,12 +226,20 @@ mod tests {
     let a = arena.alloc(Test { v: 100 });
     root!(in cx as a; a);
 
+    let b = arena.alloc(Test { v: 100 });
+    root!(in cx as b; b);
+
     assert_eq!(a.get().v, 100);
+    assert_eq!(b.get().v, 100);
     assert!(!unsafe { cx.head(Test::KIND) }.is_null());
 
+    let n = Cell::new(0usize);
     cx.for_each_root(|ptr: NonNull<Test>| {
+      n.set(n.get() + 1);
+
       let ptr = unsafe { ptr.as_ref() };
       assert_eq!(ptr.v, 100);
     });
+    assert_eq!(n.get(), 2);
   }
 }
