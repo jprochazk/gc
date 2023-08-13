@@ -1,20 +1,26 @@
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
+use std::ops::Deref;
 use std::ptr;
-use std::ptr::NonNull;
 
 #[repr(C)]
-pub struct Root<'cx, T> {
+pub struct Root<'cx, T: Rootable> {
   base: RootBase,
-  ptr: NonNull<T>,
+  // TODO: this should be `Value` or `*mut T` where `T: Object`
+  ptr: T::Pointer,
 
   // Ensure that both the lifetime `'cx` and the type `T` are invariant
   lifetime: PhantomData<fn(&'cx ()) -> &'cx ()>,
   invariant: PhantomData<&'cx mut T>,
 }
 
-impl<'cx, T: Rootable> Root<'cx, T> {
-  pub fn new(ptr: NonNull<T>) -> Self {
+impl<'cx, P, T> Root<'cx, T>
+where
+  P: RootablePointer<Pointee = T>,
+  T: Rootable<Pointer = P>,
+{
+  #[inline]
+  pub fn new(ptr: P) -> Self {
     Self {
       base: RootBase {
         head: ptr::null_mut(),
@@ -29,31 +35,38 @@ impl<'cx, T: Rootable> Root<'cx, T> {
 }
 
 #[repr(C)]
-pub struct RootGuard<'a, 'cx, T: Rootable> {
+pub struct Rooted<'root, 'cx, T: Rootable> {
   root: *mut Root<'cx, T>,
-  lifetime: PhantomData<&'a mut ()>,
+  lifetime: PhantomData<&'root mut ()>,
 }
 
-impl<'a, 'cx, T: Rootable> RootGuard<'a, 'cx, T> {
-  // TODO: This should return a `Handle<'self, T>`
-  pub fn get(&self) -> &T {
-    unsafe { (*self.root).ptr.as_ref() }
+impl<'root, 'cx, T: Rootable> Rooted<'root, 'cx, T>
+where
+  'root: 'cx,
+{
+  #[inline]
+  pub fn handle<'guard>(&'guard self) -> Handle<'guard, 'root, 'cx, T> {
+    Handle { guard: self }
   }
 
-  pub fn set(&mut self, ptr: NonNull<T>) {
-    unsafe {
-      (*self.root).ptr = ptr;
-    }
+  #[inline]
+  pub fn handle_mut<'guard>(&'guard mut self) -> HandleMut<'guard, 'root, 'cx, T> {
+    HandleMut { guard: self }
+  }
+
+  #[inline]
+  pub fn raw(&self) -> T::Pointer {
+    unsafe { (*self.root).ptr }
   }
 }
 
-impl<'a, 'cx, T: Rootable> Drop for RootGuard<'a, 'cx, T> {
+impl<'root, 'cx, T: Rootable> Drop for Rooted<'root, 'cx, T> {
   fn drop(&mut self) {
     let head: *mut *mut RootBase = unsafe { ptr::addr_of_mut!((*self.root).base.head).read() };
 
     debug_assert!(
       ptr::eq(unsafe { head.read() }, self.root.cast::<RootBase>()),
-      "RootGuard dropped, but not as root list head"
+      "Rooted dropped, but not as root list head"
     );
 
     unsafe {
@@ -63,13 +76,80 @@ impl<'a, 'cx, T: Rootable> Drop for RootGuard<'a, 'cx, T> {
   }
 }
 
+#[derive(Clone, Copy)]
+pub struct Handle<'guard, 'root, 'cx, T: Rootable> {
+  guard: &'guard Rooted<'root, 'cx, T>,
+}
+
+impl<'guard, 'root, 'cx, T: Rootable> Handle<'guard, 'root, 'cx, T> {
+  #[inline]
+  pub fn get(&self) -> T
+  where
+    T: Copy,
+  {
+    unsafe { *T::get_ref(&(*self.guard.root).ptr) }
+  }
+}
+
+impl<'guard, 'root, 'cx, T: Rootable> Deref for Handle<'guard, 'root, 'cx, T> {
+  type Target = T;
+
+  #[inline]
+  fn deref(&self) -> &Self::Target {
+    self.as_ref()
+  }
+}
+
+impl<'guard, 'root, 'cx, T: Rootable> AsRef<T> for Handle<'guard, 'root, 'cx, T> {
+  #[inline]
+  fn as_ref(&self) -> &T {
+    unsafe { T::get_ref(&(*self.guard.root).ptr) }
+  }
+}
+
+pub struct HandleMut<'guard, 'root, 'cx, T: Rootable> {
+  guard: &'guard mut Rooted<'root, 'cx, T>,
+}
+
+impl<'guard, 'root, 'cx, T: Rootable> HandleMut<'guard, 'root, 'cx, T> {
+  #[inline]
+  pub fn get(&self) -> T
+  where
+    T: Copy,
+  {
+    unsafe { *T::get_ref(&(*self.guard.root).ptr) }
+  }
+
+  #[inline]
+  pub fn set(&mut self, ptr: T::Pointer) {
+    unsafe { (*self.guard.root).ptr = ptr }
+  }
+}
+
+impl<'guard, 'root, 'cx, T: Rootable> Deref for HandleMut<'guard, 'root, 'cx, T> {
+  type Target = T;
+
+  #[inline]
+  fn deref(&self) -> &Self::Target {
+    self.as_ref()
+  }
+}
+
+impl<'guard, 'root, 'cx, T: Rootable> AsRef<T> for HandleMut<'guard, 'root, 'cx, T> {
+  #[inline]
+  fn as_ref(&self) -> &T {
+    unsafe { T::get_ref(&(*self.guard.root).ptr) }
+  }
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __root {
-  (in $cx:ident as $binding:ident; $ptr:expr) => {
+  (in $cx:ident; $binding:ident = $ptr:expr) => {
     let mut __root = $crate::rooting::Root::new($ptr);
     // SAFETY: `root` is held on the stack and will never move
-    let $binding = unsafe { $cx.append(&mut __root) };
+    #[allow(unused_mut)]
+    let mut $binding = unsafe { $cx.append(&mut __root) };
   };
 }
 
@@ -86,13 +166,35 @@ pub struct RootBase {
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RootKind {
-  Test,
+  Value,
+  Object,
 }
 
-enum_array_index!(RootKind, RootKind::Test);
+enum_array_index!(RootKind, RootKind::Object);
 
 pub trait Rootable: private::Sealed {
+  /// The root kind of `Self`, which determines how the GC will mark this root.
   const KIND: RootKind;
+
+  /// The pointer type used to refer to `Self`.
+  type Pointer: Copy;
+
+  /// Get a reference to `v`.
+  fn get_ref(v: &Self::Pointer) -> &Self;
+
+  /// Get a raw pointer to `v` without creating a temporary reference.
+  ///
+  /// # Safety
+  /// - `v` must not be null
+  /// - The implementation must not create a temporary reference to `Self`
+  unsafe fn get_raw(v: *mut Self::Pointer) -> *mut Self;
+}
+
+/// This is a helper trait used in `Root::new` to allow `Rust`
+/// to infer the `T` in `Root<'_, T>` from a pointer to `T`.
+pub trait RootablePointer: Copy + private::Sealed {
+  /// The type `Self` points to.
+  type Pointee: Rootable;
 }
 
 mod private {
@@ -122,10 +224,10 @@ impl Context {
   /// - `root` must not be moved after this call
   #[doc(hidden)]
   #[must_use]
-  pub unsafe fn append<'a, 'cx, T: Rootable>(
+  pub unsafe fn append<'root, 'cx, T: Rootable>(
     &'cx self,
-    root: &'a mut Root<'cx, T>,
-  ) -> RootGuard<'a, 'cx, T> {
+    root: &'root mut Root<'cx, T>,
+  ) -> Rooted<'root, 'cx, T> {
     let head = self.head(T::KIND);
 
     let prev = *head;
@@ -135,7 +237,7 @@ impl Context {
     root.base.prev = prev;
     head.write(root as *mut _ as *mut RootBase);
 
-    RootGuard {
+    Rooted {
       root,
       lifetime: PhantomData,
     }
@@ -143,16 +245,17 @@ impl Context {
 
   pub fn for_each_root<T, F>(&self, f: F)
   where
+    T: 'static,
     T: Rootable,
-    F: Fn(NonNull<T>),
+    F: Fn(*mut T),
   {
     unsafe {
       let head = self.head(T::KIND);
       let mut current = *head;
       while !current.is_null() {
         let prev = ptr::addr_of!((*current).prev).read();
-        let ptr = current.cast::<Root<'static, ()>>();
-        let ptr = ptr::addr_of!((*ptr).ptr).read().cast::<T>();
+        let ptr = current.cast::<Root<'static, T>>();
+        let ptr = T::get_raw(ptr::addr_of_mut!((*ptr).ptr));
         f(ptr);
         current = prev;
       }
@@ -172,14 +275,14 @@ mod tests {
   type DropInPlace = unsafe fn(*mut ());
 
   struct Arena {
-    data: RefCell<Vec<(DropInPlace, Layout, NonNull<()>)>>,
+    data: RefCell<Vec<(DropInPlace, Layout, *mut ())>>,
   }
 
   impl Drop for Arena {
     fn drop(&mut self) {
       for (drop_in_place, layout, v) in self.data.get_mut().iter().copied() {
-        unsafe { drop_in_place(v.as_ptr()) }
-        unsafe { std::alloc::dealloc(v.as_ptr().cast::<u8>(), layout) };
+        unsafe { drop_in_place(v) }
+        unsafe { std::alloc::dealloc(v.cast::<u8>(), layout) };
       }
     }
   }
@@ -191,14 +294,14 @@ mod tests {
       }
     }
 
-    fn alloc<T>(&mut self, v: T) -> NonNull<T> {
+    fn alloc<T>(&mut self, v: T) -> *mut T {
       fn drop_in_place_for<T>() -> DropInPlace {
         let drop_in_place: unsafe fn(*mut T) = ptr::drop_in_place::<T>;
         let drop_in_place: DropInPlace = unsafe { transmute(drop_in_place) };
         drop_in_place
       }
 
-      let v = unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(v))) };
+      let v = Box::into_raw(Box::new(v));
 
       self
         .data
@@ -215,7 +318,23 @@ mod tests {
 
   impl private::Sealed for Test {}
   impl Rootable for Test {
-    const KIND: RootKind = RootKind::Test;
+    const KIND: RootKind = RootKind::Object;
+
+    type Pointer = *mut Test;
+
+    #[inline]
+    fn get_ref(v: &Self::Pointer) -> &Self {
+      unsafe { &**v }
+    }
+
+    #[inline]
+    unsafe fn get_raw(v: *mut Self::Pointer) -> *mut Self {
+      ptr::addr_of_mut!(**v)
+    }
+  }
+  impl private::Sealed for *mut Test {}
+  impl RootablePointer for *mut Test {
+    type Pointee = Test;
   }
 
   #[test]
@@ -223,21 +342,30 @@ mod tests {
     let mut arena = Arena::new();
     let cx = Context::new();
 
+    // TODO: `root` macro should handle allocation
     let a = arena.alloc(Test { v: 100 });
-    root!(in cx as a; a);
+    root!(in cx; a = a);
 
-    let b = arena.alloc(Test { v: 100 });
-    root!(in cx as b; b);
+    let b = arena.alloc(Test { v: 50 });
+    root!(in cx; b = b);
 
-    assert_eq!(a.get().v, 100);
-    assert_eq!(b.get().v, 100);
+    assert_eq!(a.handle().v, 100);
+    assert_eq!(b.handle().v, 50);
+    assert!(!unsafe { cx.head(Test::KIND) }.is_null());
+
+    // NOTE: at this point, `b` will be unrooted
+    // this is fine because it's no longer reachable
+    b.handle_mut().set(a.raw());
+
+    assert_eq!(a.handle().v, 100);
+    assert_eq!(b.handle().v, 100);
     assert!(!unsafe { cx.head(Test::KIND) }.is_null());
 
     let n = Cell::new(0usize);
-    cx.for_each_root(|ptr: NonNull<Test>| {
+    cx.for_each_root(|ptr: *mut Test| {
       n.set(n.get() + 1);
 
-      let ptr = unsafe { ptr.as_ref() };
+      let ptr = unsafe { &*ptr };
       assert_eq!(ptr.v, 100);
     });
     assert_eq!(n.get(), 2);
