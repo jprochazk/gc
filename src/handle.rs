@@ -136,6 +136,7 @@ pub struct HandleScope<'ctx> {
     prev_limit: *mut Opaque,
     level: usize,
 
+    #[allow(unused)]
     lifetime: PhantomData<fn(&'ctx ()) -> &'ctx ()>,
 }
 
@@ -162,8 +163,22 @@ impl<'ctx> HandleScope<'ctx> {
     }
 
     #[inline]
+    pub fn scope<F, R>(&mut self, f: F) -> R
+    where
+        F: for<'id> FnOnce(HandleScope<'id>) -> R,
+    {
+        let handle_scope = unsafe { HandleScope::new(self.scope_data, self.allocator) };
+        f(handle_scope)
+    }
+
+    #[inline]
     pub fn alloc<T: Trace>(&self, data: T) -> Handle<'_, T> {
         unsafe {
+            assert_eq!(
+                self.level + 1,
+                (*self.scope_data).level,
+                "alloc outside of current handle scope"
+            );
             let ptr = (*self.allocator).alloc(data);
             Handle::new(self, ptr)
         }

@@ -139,6 +139,10 @@ struct Vt {
 impl Vt {
     #[inline]
     const fn get<T: Trace>(v: &T) -> *mut Vt {
+        // miri won't let us directly access the vtable, but we're willing
+        // to accept any risk about its unstable layout.
+        // so when running in miri, we use a manually constructed vtable.
+
         #[cfg(not(miri))]
         {
             let v = v as &dyn Trace;
@@ -147,27 +151,27 @@ impl Vt {
 
         #[cfg(miri)]
         {
+            trait HasVt<T: ?Sized> {
+                const VT: &'static Vt;
+            }
+
+            impl<T: Trace> HasVt<T> for T {
+                const VT: &'static Vt = unsafe {
+                    &Vt {
+                        drop_in_place: transmute::<unsafe fn(*mut T), unsafe fn(*mut Data)>(
+                            drop_in_place::<T> as unsafe fn(*mut T),
+                        ),
+                        size: size_of::<T>(),
+                        align: align_of::<T>(),
+                        #[cfg(miri)]
+                        trace: transmute::<fn(&T), fn(*const Data)>(<T as Trace>::trace),
+                    }
+                };
+            }
+
             <T as HasVt<T>>::VT as *const _ as *mut _
         }
     }
-}
-
-trait HasVt<T: ?Sized> {
-    const VT: &'static Vt;
-}
-
-impl<T: Trace> HasVt<T> for T {
-    const VT: &'static Vt = unsafe {
-        &Vt {
-            drop_in_place: transmute::<unsafe fn(*mut T), unsafe fn(*mut Data)>(
-                drop_in_place::<T> as unsafe fn(*mut T),
-            ),
-            size: size_of::<T>(),
-            align: align_of::<T>(),
-            #[cfg(miri)]
-            trace: transmute::<fn(&T), fn(*const Data)>(<T as Trace>::trace),
-        }
-    };
 }
 
 #[repr(C)]

@@ -22,10 +22,17 @@ impl Gc {
         }
     }
 
-    pub fn handle_scope(&self) -> HandleScope<'_> {
-        unsafe { HandleScope::new(self.scope_data.get(), &self.allocator) }
+    #[inline]
+    pub fn scope<F, R>(&mut self, f: F) -> R
+    where
+        F: for<'id> FnOnce(HandleScope<'id>) -> R,
+    {
+        let handle_scope = unsafe { HandleScope::new(self.scope_data.get(), &self.allocator) };
+        f(handle_scope)
     }
 
+    #[cold]
+    #[inline(never)]
     pub fn gc(&self) {
         self.mark();
         self.sweep();
@@ -150,11 +157,11 @@ mod tests {
 
     #[test]
     fn use_context() {
-        let ctx = Gc::new();
-        let scope = ctx.handle_scope();
-        let v = scope.alloc(Test { value: 100 });
-
-        println!("{}", v.value);
+        let mut ctx = Gc::new();
+        ctx.scope(|s| {
+            let v = s.alloc(Test { value: 100 });
+            println!("{}", v.value);
+        });
     }
 
     #[test]
@@ -167,10 +174,10 @@ mod tests {
         // null <- A
         //         0
 
-        let ctx = Gc::new();
-        let scope = ctx.handle_scope();
-        let _ = scope.alloc(Test { value: 100 });
-        drop(scope);
+        let mut ctx = Gc::new();
+        ctx.scope(|s| {
+            let _ = s.alloc(Test { value: 200 });
+        });
 
         ctx.gc();
     }

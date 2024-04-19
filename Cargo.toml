@@ -3,13 +3,3 @@ name = "gc"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-intmap = "2.0.0"
-
-[features]
-default = ["__verbose_gc"]
-
-## Turn on verbose logging in the GC
-__verbose_gc = []

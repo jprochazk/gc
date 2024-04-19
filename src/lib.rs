@@ -1,6 +1,5 @@
 #![allow(clippy::new_without_default)]
 
-#[macro_use]
 macro_rules! function {
     () => {{
         fn f() {}
@@ -12,18 +11,13 @@ macro_rules! function {
     }};
 }
 
-#[macro_use]
-mod macros {
-    macro_rules! debug {
-        ($($tt:tt)+) => {
-            #[cfg(all(debug_assertions, feature = "__verbose_gc"))] {
-                use std::io::Write;
-                let mut stderr = std::io::stderr();
-                let _ = stderr.write_all("[".as_bytes());
-                let _ = stderr.write_all(function!().as_bytes());
-                let _ = stderr.write_all("]: ".as_bytes());
-                let _ = writeln!(stderr, $($tt)+);
-            }
+macro_rules! debug {
+    ($($tt:tt)+) => {
+        #[cfg(all(debug_assertions, __verbose_gc))] {
+            print!("[");
+            print!("{}", function!());
+            print!("]: ");
+            println!($($tt)+);
         }
     }
 }
