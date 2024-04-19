@@ -23,95 +23,58 @@
 //! - The GC is not aware of `a`,
 //! - `allocate` may trigger a GC cycle
 //!
-//! A handle solve the problem by ensuring that the GC is always aware of `a`.
+//! A handle solves the problem by ensuring that the GC is always aware of `a`.
 //!
 //! A nice side-effect of this scheme is that it enables using any precise garbage
 //! collection algorithm under the hood.
 
-/*
-
-#[derive(Object)]
-struct Foo {
-    bar: Heap<Bar>,
-}
-
-#[derive(Object)]
-struct Bar {
-    value: Cell<usize>,
-}
-
-fn main() {
-    let mut gc = Gc::new();
-
-    let mut scope = gc.context().handle_scope();
-
-    let foo = scope.new(Foo {
-        bar: scope.new(Bar {
-            value: Cell::new(100),
-        }).into()
-    });
-}
-
-*/
-
-use std::cell::UnsafeCell;
+use crate::alloc::Allocator;
+use crate::alloc::Data;
+use crate::alloc::GcCell;
+use crate::gc::Trace;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ptr::addr_of_mut;
 use std::ptr::null_mut;
 
 // Surely pages are at least 4kB!
-const BLOCK_SIZE: usize = 4096 / std::mem::size_of::<OpaquePtr>();
+const BLOCK_SIZE: usize = 4096 / std::mem::size_of::<Opaque>();
 
-type HandleBlock = [OpaquePtr; BLOCK_SIZE];
+type Opaque = *mut GcCell<Data>;
 
-type OpaquePtr = *mut ();
-
-type BlockList = Vec<Box<HandleBlock>>;
+type BlockList = Vec<Box<[Opaque; BLOCK_SIZE]>>;
 
 pub trait Object: Sized + 'static {}
 
-pub struct Context {
-    scope_data: UnsafeCell<HandleScopeData>,
-}
-
-impl Context {
-    pub fn new() -> Self {
-        Self {
-            scope_data: UnsafeCell::new(HandleScopeData {
-                next: null_mut(),
-                limit: null_mut(),
-                level: 0,
-                blocks: BlockList::new(),
-            }),
-        }
-    }
-
-    fn handle_scope(&mut self) -> HandleScope<'_> {
-        unsafe { HandleScope::new(self) }
-    }
-}
-
-impl Default for Context {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-struct HandleScopeData {
+pub(crate) struct HandleScopeData {
     /// The next available handle slot.
     ///
     /// None left if `next == limit`.
-    next: *mut OpaquePtr,
+    pub(crate) next: *mut Opaque,
 
     /// End of the handle block.
-    limit: *mut OpaquePtr,
+    limit: *mut Opaque,
 
     /// Handle scope nesting depth.
     level: usize,
 
     /// Handle block list, the last used block is the one pointed to by `scope_data`.
-    blocks: BlockList,
+    pub(crate) blocks: BlockList,
+}
+
+impl HandleScopeData {
+    pub(crate) fn new() -> Self {
+        let mut this = Self {
+            next: null_mut(),
+            limit: null_mut(),
+            level: 0,
+            blocks: BlockList::new(),
+        };
+        unsafe {
+            HandleScopeData::allocate_block(&mut this);
+        }
+        this
+    }
 }
 
 impl HandleScopeData {
@@ -126,6 +89,8 @@ impl HandleScopeData {
         let next = (*blocks).last_mut().unwrap_unchecked().as_mut_ptr();
         let limit = next.add(BLOCK_SIZE); // block~[BLOCK_SIZE + 1]
 
+        debug!("next={next:p}, limit={limit:p}");
+
         (*this).next = next;
         (*this).limit = limit;
     }
@@ -134,9 +99,9 @@ impl HandleScopeData {
     #[inline(never)]
     unsafe fn free_unused_blocks(this: *mut HandleScopeData) {
         #[inline(always)]
-        unsafe fn block_limit(blocks: *mut BlockList, index: usize) -> *mut OpaquePtr {
+        unsafe fn block_limit(blocks: *mut BlockList, index: usize) -> *mut Opaque {
             let slice = Box::into_raw((*blocks).as_mut_ptr().add(index).read());
-            let start = slice as *mut OpaquePtr;
+            let start = slice as *mut Opaque;
             start.add(BLOCK_SIZE)
         }
 
@@ -152,41 +117,56 @@ impl HandleScopeData {
         assert!((*blocks).len() > 1, "cannot free unused blocks with len=1");
 
         // Any block past `current.limit` is unused
-        let current_limit: *mut OpaquePtr = (*this).limit;
+        let current_limit: *mut Opaque = (*this).limit;
         let mut index = (*blocks).len() - 1;
         while block_limit(blocks, index) != current_limit {
             manually_drop_block_at(blocks, index);
             index -= 1;
         }
+        debug!("free {n} blocks", n = (*blocks).len() - index + 1);
         (*blocks).set_len(index + 1);
     }
 }
 
 pub struct HandleScope<'ctx> {
-    ctx: *mut Context,
-    prev_next: *mut OpaquePtr,
-    prev_limit: *mut OpaquePtr,
+    scope_data: *mut HandleScopeData,
+    allocator: *const Allocator,
+
+    prev_next: *mut Opaque,
+    prev_limit: *mut Opaque,
+    level: usize,
 
     lifetime: PhantomData<fn(&'ctx ()) -> &'ctx ()>,
 }
 
 impl<'ctx> HandleScope<'ctx> {
-    unsafe fn new(ctx: &'ctx mut Context) -> Self {
-        let current = ctx.scope_data.get();
-        let prev_next = (*current).next;
-        let prev_limit = (*current).limit;
-        (*current).level += 1;
+    pub(crate) unsafe fn new(
+        scope_data: *mut HandleScopeData,
+        allocator: *const Allocator,
+    ) -> Self {
+        let prev_next = (*scope_data).next;
+        let prev_limit = (*scope_data).limit;
+        let level = (*scope_data).level;
+        (*scope_data).level += 1;
+
+        debug!("prev_next={prev_next:p}, prev_limit={prev_limit:p}, level={level}");
 
         HandleScope {
-            ctx,
+            scope_data,
+            allocator,
             prev_next,
             prev_limit,
+            level,
             lifetime: PhantomData,
         }
     }
 
-    unsafe fn data(&mut self) -> *mut HandleScopeData {
-        addr_of_mut!((*self.ctx).scope_data) as *mut HandleScopeData
+    #[inline]
+    pub fn alloc<T: Trace>(&self, data: T) -> Handle<'_, T> {
+        unsafe {
+            let ptr = (*self.allocator).alloc(data);
+            Handle::new(self, ptr)
+        }
     }
 }
 
@@ -194,9 +174,18 @@ impl<'ctx> Drop for HandleScope<'ctx> {
     fn drop(&mut self) {
         unsafe {
             // Reset to previous scope
-            let scope_data = self.data();
+            let scope_data = self.scope_data;
             (*scope_data).next = self.prev_next;
             (*scope_data).level -= 1;
+
+            debug!(
+                "data.next={next:p}, data.level={level}",
+                next = (*scope_data).next,
+                level = (*scope_data).level
+            );
+
+            // handle scopes must be created and dropped in stack order
+            assert_eq!((*scope_data).level, self.level);
 
             // If we have a different limit, then we must have allocated one or more new blocks
             // Free those now, because they're no longer being used
@@ -211,15 +200,15 @@ impl<'ctx> Drop for HandleScope<'ctx> {
 
 pub struct Handle<'scope, T> {
     /// Pointer to the handle slot which contains the actual memory location of `T`.
-    slot: *mut OpaquePtr,
+    slot: *mut Opaque,
 
     lifetime: PhantomData<fn(&'scope T) -> &'scope T>,
 }
 
 impl<'scope, T> Handle<'scope, T> {
-    unsafe fn new(scope: &'scope mut HandleScope<'_>, ptr: *mut T) -> Self {
+    pub(crate) unsafe fn new(scope: &'scope HandleScope<'_>, ptr: *mut GcCell<T>) -> Self {
         // Grow if needed
-        let scope_data = scope.data();
+        let scope_data = scope.scope_data;
         if (*scope_data).next == (*scope_data).limit {
             HandleScopeData::allocate_block(scope_data);
         }
@@ -229,7 +218,12 @@ impl<'scope, T> Handle<'scope, T> {
         (*scope_data).next = (*scope_data).next.add(1);
 
         // Initialize the slot
-        *slot = ptr as OpaquePtr;
+        *slot = ptr as Opaque;
+
+        debug!(
+            "{slot:p} = {ptr:p}, next = {next:p}",
+            next = (*scope_data).next
+        );
 
         Handle {
             slot,
