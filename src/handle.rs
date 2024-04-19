@@ -171,6 +171,8 @@ impl<'ctx> Scope<'ctx> {
     #[inline]
     pub fn alloc<T: Trace>(&self, data: T) -> Local<'_, T> {
         unsafe {
+            // TODO: trigger GC here if heap is somewhat full
+
             assert_eq!(
                 self.level + 1,
                 (*self.scope_data).level,
