@@ -130,7 +130,7 @@ impl ScopeData {
 
 pub struct Scope<'ctx> {
     scope_data: *mut ScopeData,
-    allocator: *const Allocator,
+    allocator: *mut Allocator,
 
     prev_next: *mut Opaque,
     prev_limit: *mut Opaque,
@@ -141,7 +141,7 @@ pub struct Scope<'ctx> {
 }
 
 impl<'ctx> Scope<'ctx> {
-    pub(crate) unsafe fn new(scope_data: *mut ScopeData, allocator: *const Allocator) -> Self {
+    pub(crate) unsafe fn new(scope_data: *mut ScopeData, allocator: *mut Allocator) -> Self {
         let prev_next = (*scope_data).next;
         let prev_limit = (*scope_data).limit;
         let level = (*scope_data).level;
