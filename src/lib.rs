@@ -1,13 +1,15 @@
 #![allow(clippy::new_without_default)]
 
-macro_rules! function {
+#[cfg(all(debug_assertions, __verbose_gc))]
+fn type_name_of<T>(_: T) -> &'static str {
+    std::any::type_name::<T>()
+}
+
+#[cfg(all(debug_assertions, __verbose_gc))]
+macro_rules! __function {
     () => {{
         fn f() {}
-        fn type_name_of<T>(_: T) -> &'static str {
-            std::any::type_name::<T>()
-        }
-        let name = type_name_of(f);
-        name.strip_suffix("::f").unwrap()
+        $crate::type_name_of(f).strip_suffix("::f").unwrap()
     }};
 }
 
@@ -15,7 +17,7 @@ macro_rules! debug {
     ($($tt:tt)+) => {
         #[cfg(all(debug_assertions, __verbose_gc))] {
             print!("[");
-            print!("{}", function!());
+            print!("{}", __function!());
             print!("]: ");
             println!($($tt)+);
         }

@@ -3,12 +3,9 @@ use std::alloc::dealloc;
 use std::alloc::Layout;
 use std::cell::Cell;
 use std::cell::UnsafeCell;
-use std::mem::align_of;
-use std::mem::size_of;
 use std::mem::transmute;
 use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
-use std::ptr::drop_in_place;
 use std::ptr::null_mut;
 
 pub struct Allocator {
@@ -157,6 +154,10 @@ impl Vt {
 
             impl<T: Trace> HasVt<T> for T {
                 const VT: &'static Vt = unsafe {
+                    use std::mem::align_of;
+                    use std::mem::size_of;
+                    use std::ptr::drop_in_place;
+
                     &Vt {
                         drop_in_place: transmute::<unsafe fn(*mut T), unsafe fn(*mut Data)>(
                             drop_in_place::<T> as unsafe fn(*mut T),
