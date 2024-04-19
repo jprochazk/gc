@@ -166,17 +166,24 @@ mod tests {
 
     #[test]
     fn mark_and_sweep_0() {
-        // null <- A
-        //         1
+        // null <- A <- B <- C
+        //         1    1    1
         //
-        // (0) current: A, prev: null -> no mark, stop
+        // (0) current: C, prev: B, C is live
+        // (1) current: B, prev: A, B is live
+        // (2) current: A, prev: null, A is live
         //
-        // null <- A
-        //         0
+        // null <- A <- B <- C
+        //         0    0    0
 
         let mut ctx = Gc::new();
         ctx.scope(|s| {
-            let _ = s.alloc(Test { value: 200 });
+            let a = s.alloc(Test { value: 200 });
+            let b = s.alloc(Test { value: 300 });
+            println!("{}", a.value);
+            println!("{}", b.value);
+            let c = s.alloc(Test { value: 400 });
+            println!("{}", c.value);
         });
 
         ctx.gc();
