@@ -5,10 +5,10 @@ Experimenting with a safe Rust GC design based on V8's handle scope concept.
 ## Current state
 
 ```rust
-let gc = Gc::new();
+let cx = Gc::new();
 
 // Uses generative lifetimes to ensure references on the stack don't escape their scope
-gc.scope(|s| {
+cx.scope(|s| {
   // Values are allocated on the heap, and returned as lightweight handles
   // These handles can be freely passed around, and implement `Deref<Target = T>`.
   let a: Local<Value> = s.alloc(Value);
@@ -28,7 +28,7 @@ struct Thing<'gc> {
   value: Heap<'gc, Value>,
 }
 
-gc.scope(|s| {
+cx.scope(|s| {
   let thing = s.alloc(Thing {
     value: s.alloc(Value).into()
   });
