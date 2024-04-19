@@ -1,6 +1,6 @@
 # gc
 
-Experimenting with safe Rust GC designs
+Experimenting with safe Rust GC design based on V8's handle scope concept.
 
 ## Current state
 
@@ -32,7 +32,7 @@ gc.scope(|s| {
   let thing = s.alloc(Thing {
     value: s.alloc(Value).into()
   });
-  
+
   // `Heap` does not implement `Deref`.
   // In order to dereference a `Heap`, you must first root it in some scope:
   let value: Handle<'_, Value> = thing.value.root(s);
