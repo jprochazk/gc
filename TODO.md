@@ -1,8 +1,0 @@
-- [x] `Handle` API
-- [ ] Allocation is unsound, it should always start out as rooted (with an unsafe API to allocate unrooted values)
-- [ ] In debug mode, moves of allocations should be tracked:
-  - Move to a `Root`
-  - Move to a `Heap`
-- [ ] Ability to store `Value`, `Object`, and `T: Type` in `Root`
-  - Two root kinds: `Value`, `Object`
-  - `T: Type` is just `Object`

@@ -11,10 +11,10 @@ let gc = Gc::new();
 gc.scope(|s| {
   // Values are allocated on the heap, and returned as lightweight handles
   // These handles can be freely passed around, and implement `Deref<Target = T>`.
-  let a: Handle<Value> = s.alloc(Value);
+  let a: Local<Value> = s.alloc(Value);
 
   // Every call to `alloc` may trigger a GC cycle, even if there are live references.
-  let b: Handle<Value> = s.alloc(Value);
+  let b: Local<Value> = s.alloc(Value);
 })
 ```
 
@@ -35,6 +35,6 @@ gc.scope(|s| {
 
   // `Heap` does not implement `Deref`.
   // In order to dereference a `Heap`, you must first root it in some scope:
-  let value: Handle<'_, Value> = thing.value.root(s);
+  let value: Local<'_, Value> = thing.value.root(s);
 })
 ```
