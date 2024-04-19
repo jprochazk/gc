@@ -1,6 +1,6 @@
 # gc
 
-Experimenting with safe Rust GC design based on V8's handle scope concept.
+Experimenting with a safe Rust GC design based on V8's handle scope concept.
 
 ## Current state
 
