@@ -1,7 +1,7 @@
 use crate::alloc::Allocator;
 use crate::alloc::GcCell;
-use crate::handle::HandleScope;
-use crate::handle::HandleScopeData;
+use crate::handle::Scope;
+use crate::handle::ScopeData;
 use std::cell::UnsafeCell;
 use std::ptr::null_mut;
 
@@ -10,14 +10,14 @@ pub trait Trace {
 }
 
 pub struct Gc {
-    scope_data: UnsafeCell<HandleScopeData>,
+    scope_data: UnsafeCell<ScopeData>,
     allocator: Allocator,
 }
 
 impl Gc {
     pub fn new() -> Self {
         Self {
-            scope_data: UnsafeCell::new(HandleScopeData::new()),
+            scope_data: UnsafeCell::new(ScopeData::new()),
             allocator: Allocator::new(),
         }
     }
@@ -25,9 +25,9 @@ impl Gc {
     #[inline]
     pub fn scope<F, R>(&mut self, f: F) -> R
     where
-        F: for<'id> FnOnce(HandleScope<'id>) -> R,
+        F: for<'id> FnOnce(Scope<'id>) -> R,
     {
-        let handle_scope = unsafe { HandleScope::new(self.scope_data.get(), &self.allocator) };
+        let handle_scope = unsafe { Scope::new(self.scope_data.get(), &self.allocator) };
         f(handle_scope)
     }
 

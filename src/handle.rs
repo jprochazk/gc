@@ -1,6 +1,6 @@
 //! Heap-allocated GC handles.
 //!
-//! Each `Handle<T>` is a double indirection, similar to `*mut *mut T`.
+//! Each `Local<T>` is a double indirection, similar to `*mut *mut T`.
 //! The first pointer is to the slot in the handle block, and the second
 //! to the actual value on the GC heap.
 //!
@@ -10,7 +10,7 @@
 //! treated as part of the root set by the GC, so the referenced objects are
 //! always considered live.
 //!
-//! That means having a `Handle<T>` allows derefencing to the `T`, without
+//! That means having a `Local<T>` allows derefencing to the `T`, without
 //! risking a potential use-after-free, which may arise when an object
 //! reference is held on the stack across GC points (such as an allocation):
 //!
@@ -46,23 +46,23 @@ type BlockList = Vec<Box<[Opaque; BLOCK_SIZE]>>;
 
 pub trait Object: Sized + 'static {}
 
-pub(crate) struct HandleScopeData {
-    /// The next available handle slot.
+pub(crate) struct ScopeData {
+    /// Next available slot in the current block.
     ///
     /// None left if `next == limit`.
     pub(crate) next: *mut Opaque,
 
-    /// End of the handle block.
+    /// End of the current block.
     limit: *mut Opaque,
 
-    /// Handle scope nesting depth.
+    /// Scope nesting depth.
     level: usize,
 
-    /// Handle block list, the last used block is the one pointed to by `scope_data`.
+    /// Last used block contains `scope_data.next`.
     pub(crate) blocks: BlockList,
 }
 
-impl HandleScopeData {
+impl ScopeData {
     pub(crate) fn new() -> Self {
         let mut this = Self {
             next: null_mut(),
@@ -71,16 +71,16 @@ impl HandleScopeData {
             blocks: BlockList::new(),
         };
         unsafe {
-            HandleScopeData::allocate_block(&mut this);
+            ScopeData::allocate_block(&mut this);
         }
         this
     }
 }
 
-impl HandleScopeData {
+impl ScopeData {
     #[cold]
     #[inline(never)]
-    unsafe fn allocate_block(this: *mut HandleScopeData) {
+    unsafe fn allocate_block(this: *mut ScopeData) {
         // Push a new block onto the list
         let blocks = addr_of_mut!((*this).blocks);
         (*blocks).push(Box::new([null_mut(); BLOCK_SIZE]));
@@ -97,7 +97,7 @@ impl HandleScopeData {
 
     #[cold]
     #[inline(never)]
-    unsafe fn free_unused_blocks(this: *mut HandleScopeData) {
+    unsafe fn free_unused_blocks(this: *mut ScopeData) {
         #[inline(always)]
         unsafe fn block_limit(blocks: *mut BlockList, index: usize) -> *mut Opaque {
             let slice = Box::into_raw((*blocks).as_mut_ptr().add(index).read());
@@ -128,8 +128,8 @@ impl HandleScopeData {
     }
 }
 
-pub struct HandleScope<'ctx> {
-    scope_data: *mut HandleScopeData,
+pub struct Scope<'ctx> {
+    scope_data: *mut ScopeData,
     allocator: *const Allocator,
 
     prev_next: *mut Opaque,
@@ -140,11 +140,8 @@ pub struct HandleScope<'ctx> {
     lifetime: PhantomData<fn(&'ctx ()) -> &'ctx ()>,
 }
 
-impl<'ctx> HandleScope<'ctx> {
-    pub(crate) unsafe fn new(
-        scope_data: *mut HandleScopeData,
-        allocator: *const Allocator,
-    ) -> Self {
+impl<'ctx> Scope<'ctx> {
+    pub(crate) unsafe fn new(scope_data: *mut ScopeData, allocator: *const Allocator) -> Self {
         let prev_next = (*scope_data).next;
         let prev_limit = (*scope_data).limit;
         let level = (*scope_data).level;
@@ -152,7 +149,7 @@ impl<'ctx> HandleScope<'ctx> {
 
         debug!("prev_next={prev_next:p}, prev_limit={prev_limit:p}, level={level}");
 
-        HandleScope {
+        Scope {
             scope_data,
             allocator,
             prev_next,
@@ -165,14 +162,14 @@ impl<'ctx> HandleScope<'ctx> {
     #[inline]
     pub fn scope<F, R>(&mut self, f: F) -> R
     where
-        F: for<'id> FnOnce(HandleScope<'id>) -> R,
+        F: for<'id> FnOnce(Scope<'id>) -> R,
     {
-        let handle_scope = unsafe { HandleScope::new(self.scope_data, self.allocator) };
+        let handle_scope = unsafe { Scope::new(self.scope_data, self.allocator) };
         f(handle_scope)
     }
 
     #[inline]
-    pub fn alloc<T: Trace>(&self, data: T) -> Handle<'_, T> {
+    pub fn alloc<T: Trace>(&self, data: T) -> Local<'_, T> {
         unsafe {
             assert_eq!(
                 self.level + 1,
@@ -180,12 +177,12 @@ impl<'ctx> HandleScope<'ctx> {
                 "alloc outside of current handle scope"
             );
             let ptr = (*self.allocator).alloc(data);
-            Handle::new(self, ptr)
+            Local::new(self, ptr)
         }
     }
 }
 
-impl<'ctx> Drop for HandleScope<'ctx> {
+impl<'ctx> Drop for Scope<'ctx> {
     fn drop(&mut self) {
         unsafe {
             // Reset to previous scope
@@ -207,25 +204,25 @@ impl<'ctx> Drop for HandleScope<'ctx> {
             // TODO: always keep one spare block
             if (*scope_data).limit != self.prev_limit {
                 (*scope_data).limit = self.prev_limit;
-                HandleScopeData::free_unused_blocks(scope_data);
+                ScopeData::free_unused_blocks(scope_data);
             }
         }
     }
 }
 
-pub struct Handle<'scope, T> {
+pub struct Local<'scope, T> {
     /// Pointer to the handle slot which contains the actual memory location of `T`.
     slot: *mut Opaque,
 
     lifetime: PhantomData<fn(&'scope T) -> &'scope T>,
 }
 
-impl<'scope, T> Handle<'scope, T> {
-    pub(crate) unsafe fn new(scope: &'scope HandleScope<'_>, ptr: *mut GcCell<T>) -> Self {
+impl<'scope, T> Local<'scope, T> {
+    pub(crate) unsafe fn new(scope: &'scope Scope<'_>, ptr: *mut GcCell<T>) -> Self {
         // Grow if needed
         let scope_data = scope.scope_data;
         if (*scope_data).next == (*scope_data).limit {
-            HandleScopeData::allocate_block(scope_data);
+            ScopeData::allocate_block(scope_data);
         }
 
         // The actual allocation (pointer bump)
@@ -240,14 +237,14 @@ impl<'scope, T> Handle<'scope, T> {
             next = (*scope_data).next
         );
 
-        Handle {
+        Local {
             slot,
             lifetime: PhantomData,
         }
     }
 }
 
-impl<'scope, T> Deref for Handle<'scope, T> {
+impl<'scope, T> Deref for Local<'scope, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
