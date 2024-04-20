@@ -6,7 +6,9 @@ use std::cell::UnsafeCell;
 use std::ptr::null_mut;
 
 pub trait Trace {
-    fn trace(&self);
+    /// # Safety
+    /// This method is unsafe to implement, because the implementation _must_ trace all interior references.
+    unsafe fn trace(&self);
 }
 
 pub struct Gc {
@@ -15,20 +17,23 @@ pub struct Gc {
 }
 
 impl Gc {
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
             scope_data: UnsafeCell::new(ScopeData::new()),
-            allocator: UnsafeCell::new(Allocator::new()),
+            allocator: UnsafeCell::new(Allocator::new(config.allocator)),
         }
     }
 
     #[inline]
-    pub fn scope<F, R>(&mut self, f: F) -> R
+    pub fn scope<'ctx, F>(&'ctx self, f: F)
     where
-        F: for<'id> FnOnce(Scope<'id>) -> R,
+        F: for<'id> FnOnce(&'id Scope<'ctx>),
     {
-        let handle_scope = unsafe { Scope::new(self.scope_data.get(), self.allocator.get()) };
-        f(handle_scope)
+        unsafe {
+            assert_eq!((*self.scope_data.get()).level, 0);
+            let scope = Scope::new(self.scope_data.get(), self.allocator.get());
+            f(&scope);
+        }
     }
 
     pub(crate) fn scope_data(&self) -> *mut ScopeData {
@@ -37,6 +42,12 @@ impl Gc {
 
     pub(crate) fn allocator(&self) -> *mut Allocator {
         self.allocator.get()
+    }
+}
+
+impl Default for Gc {
+    fn default() -> Self {
+        Self::new(Config::default())
     }
 }
 
@@ -53,7 +64,27 @@ impl Drop for Gc {
     }
 }
 
-#[cold]
+#[derive(Clone, Copy)]
+pub struct Config {
+    allocator: crate::alloc::Config,
+}
+
+impl Config {
+    pub fn stress(mut self, v: bool) -> Self {
+        self.allocator.stress = v;
+        self
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            allocator: crate::alloc::Config::default(),
+        }
+    }
+}
+
 #[inline(never)]
 pub(crate) fn gc(scope_data: *mut ScopeData, allocator: *mut Allocator) {
     mark(scope_data);
@@ -68,19 +99,37 @@ fn mark(scope_data: *mut ScopeData) {
         // for us that's only live handles
         let scope_data = &*scope_data;
         'iter: for block in &scope_data.blocks {
+            debug!(
+                "live handles: {handles:?}",
+                handles = block
+                    .as_slice()
+                    .iter()
+                    .take_while(|&handle| !std::ptr::addr_eq(handle, scope_data.next))
+                    .map(|handle| (DebugPtr(handle), DebugPtr(*handle)))
+                    .collect::<Vec<_>>()
+            );
             for handle in block.as_slice().iter() {
-                debug!("visit handle {handle:p}");
+                if std::ptr::addr_eq(handle, scope_data.next) {
+                    break 'iter;
+                }
+
                 if (*handle).is_null() {
                     continue;
                 }
 
+                debug!("visit handle {handle:p}");
                 GcCell::trace(*handle);
-
-                if std::ptr::addr_eq(handle, scope_data.next) {
-                    break 'iter;
-                }
             }
         }
+    }
+}
+
+#[cfg(__verbose_gc)]
+struct DebugPtr<T>(*const T);
+#[cfg(__verbose_gc)]
+impl<T> std::fmt::Debug for DebugPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:p}", self.0)
     }
 }
 
@@ -110,9 +159,9 @@ fn sweep(allocator: *mut Allocator) {
     //   null <- A <- B <- E
     //   mark:   0    0    0
 
-    let allocator = unsafe { &*allocator };
-
     unsafe {
+        let allocator = &*allocator;
+
         // last marked object, which will have its `prev` pointer updated as we sweep dead objects
         let mut last_live = null_mut();
 
@@ -151,25 +200,50 @@ fn sweep(allocator: *mut Allocator) {
     }
 }
 
+impl<'gc, T: Trace + 'gc> Trace for crate::handle::Heap<'gc, T> {
+    unsafe fn trace(&self) {
+        GcCell::trace(GcCell::erase(self.ptr).cast_const())
+    }
+}
+
+impl<T: Trace> Trace for Option<T> {
+    unsafe fn trace(&self) {
+        if let Some(v) = self {
+            v.trace();
+        }
+    }
+}
+
+impl<T: Trace> Trace for std::cell::RefCell<T> {
+    unsafe fn trace(&self) {
+        self.borrow().trace();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handle::Escape;
+    use crate::handle::Heap;
+    use crate::handle::Local;
+    use crate::handle::LocalMut;
+    use std::cell::RefCell;
 
     struct Test {
         value: u32,
     }
 
     impl Trace for Test {
-        fn trace(&self) {}
+        unsafe fn trace(&self) {}
     }
 
     #[test]
-    fn use_context() {
-        let mut cx = Gc::new();
+    fn simple() {
+        let cx = Gc::default();
 
         cx.scope(|s| {
             let v = s.alloc(Test { value: 100 });
-            println!("{}", v.value);
+            assert_eq!(v.value, 100);
         });
     }
 
@@ -185,17 +259,159 @@ mod tests {
         // null <- A <- B <- C
         //         0    0    0
 
-        let mut cx = Gc::new();
+        let cx = Gc::default();
 
-        cx.scope(|s| {
-            let a = s.alloc(Test { value: 200 });
-            let b = s.alloc(Test { value: 300 });
-            println!("{}", a.value);
-            println!("{}", b.value);
-            let c = s.alloc(Test { value: 400 });
-            println!("{}", c.value);
+        cx.scope(|cx| {
+            let a = cx.alloc(Test { value: 200 });
+            let b = cx.alloc(Test { value: 300 });
+            assert_eq!(a.value, 200);
+            assert_eq!(b.value, 300);
+            let c = cx.alloc(Test { value: 400 });
+            assert_eq!(c.value, 400);
         });
 
         gc(cx.scope_data(), cx.allocator());
+    }
+
+    #[test]
+    fn mark_and_sweep_1() {
+        // don't automatically trigger GC in this case
+        let cx = Gc::new(Config::default().stress(false));
+
+        // null <- A <- B <- C <- D <- E <- F
+        //         1    0    1    0    0    1
+        //
+        // (0) current: F, prev: E      F is marked, unmark
+        // (1) current: E, prev: D      E is NOT marked, free, set F.prev = D
+        // (2) current: D, prev: C      D is NOT marked, free, set F.prev = C
+        // (3) current: C, prev: B      C is marked, unmark
+        // (4) current: B, prev: A      B is NOT marked, free, set C.prev = A
+        // (5) current: A, prev: null   A is marked, unmark
+        //
+        // null <- A <- C <- F
+        //         0    0    0
+
+        cx.scope(|cx| {
+            let a = cx.alloc(Test { value: 100 });
+
+            cx.scope(|cx| {
+                cx.alloc(Test { value: 200 });
+            });
+
+            let c = cx.alloc(Test { value: 300 });
+
+            cx.scope(|cx| {
+                let d = cx.alloc(Test { value: 400 });
+                _ = d;
+            });
+
+            cx.scope(|cx| {
+                let e = cx.alloc(Test { value: 500 });
+                _ = e;
+            });
+
+            let f = cx.alloc(Test { value: 600 });
+
+            assert_eq!(a.value + c.value + f.value, 1000);
+
+            // run the GC while A, C, F are live
+            gc(cx.scope_data(), cx.allocator());
+        });
+    }
+
+    struct Compound<'gc> {
+        data: Heap<'gc, Test>,
+    }
+
+    impl<'gc> Trace for Compound<'gc> {
+        unsafe fn trace(&self) {
+            self.data.trace()
+        }
+    }
+
+    #[test]
+    fn mark_and_sweep_2() {
+        // don't automatically trigger GC in this case
+        let cx = Gc::new(Config::default().stress(false));
+
+        cx.scope(|cx| {
+            // gc...
+
+            let data = cx.alloc(Test { value: 100 }).to_heap();
+            let v = cx.alloc(Compound { data });
+
+            let data = v.data.to_local(cx);
+            assert_eq!(data.value, 100);
+        })
+    }
+
+    struct Node<'gc> {
+        prev: RefCell<Option<Heap<'gc, Node<'gc>>>>,
+        next: RefCell<Option<Heap<'gc, Node<'gc>>>>,
+        value: u32,
+    }
+
+    impl<'gc> Trace for Node<'gc> {
+        unsafe fn trace(&self) {
+            self.prev.trace();
+            self.next.trace();
+        }
+    }
+
+    impl<'gc> Node<'gc> {
+        fn new(cx: &'gc Scope<'_>, value: u32) -> Local<'gc, Node<'gc>> {
+            cx.alloc(Node {
+                prev: RefCell::new(None),
+                next: RefCell::new(None),
+                value,
+            })
+        }
+    }
+
+    fn node_join<'gc>(left: Local<'gc, Node<'gc>>, right: Local<'gc, Node<'gc>>) {
+        *left.next.borrow_mut() = Some(right.to_heap());
+        *right.prev.borrow_mut() = Some(left.to_heap());
+    }
+
+    fn node_rotate_right<'gc>(scope: &'gc Scope<'_>, node: &mut Heap<'gc, Node<'gc>>) -> bool {
+        if let Some(next) = node.to_local(scope).next.borrow().as_ref() {
+            *node = *next;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn node_rotate_left<'gc>(scope: &'gc Scope<'_>, node: &mut Heap<'gc, Node<'gc>>) -> bool {
+        if let Some(prev) = node.to_local(scope).prev.borrow().as_ref() {
+            *node = *prev;
+            true
+        } else {
+            false
+        }
+    }
+
+    impl<'from, 'to> Escape<'from, 'to> for Node<'from> {
+        type To = Node<'to>;
+
+        unsafe fn move_to(this: Local<'from, Self>, out: LocalMut<'to, Self::To>) {
+            let this = std::mem::transmute::<Local<'from, Self>, Local<'to, Self::To>>(this);
+            out.set(this);
+        }
+    }
+
+    #[test]
+    fn escape_value() {
+        let cx = Gc::default();
+
+        cx.scope(|cx| {
+            let escaped = cx.escape(|cx, out| {
+                Node::new(cx, 100).escape(out);
+            });
+
+            gc(cx.scope_data(), cx.allocator());
+
+            assert_eq!(escaped.value, 100);
+        });
     }
 }

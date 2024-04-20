@@ -1,0 +1,5 @@
+{
+  "rust-analyzer.runnables.extraEnv": {
+    "RUSTFLAGS": "--cfg=__verbose_gc"
+  }
+}

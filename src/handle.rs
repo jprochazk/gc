@@ -40,7 +40,8 @@ use std::ptr::null_mut;
 // Surely pages are at least 4kB!
 const BLOCK_SIZE: usize = 4096 / std::mem::size_of::<Opaque>();
 
-type Opaque = *mut GcCell<Data>;
+type HeapRef<T> = *mut GcCell<T>;
+type Opaque = HeapRef<Data>;
 
 type BlockList = Vec<Box<[Opaque; BLOCK_SIZE]>>;
 
@@ -53,10 +54,10 @@ pub(crate) struct ScopeData {
     pub(crate) next: *mut Opaque,
 
     /// End of the current block.
-    limit: *mut Opaque,
+    pub(crate) limit: *mut Opaque,
 
     /// Scope nesting depth.
-    level: usize,
+    pub(crate) level: usize,
 
     /// Last used block contains `scope_data.next`.
     pub(crate) blocks: BlockList,
@@ -160,18 +161,39 @@ impl<'ctx> Scope<'ctx> {
     }
 
     #[inline]
-    pub fn scope<F, R>(&mut self, f: F) -> R
+    pub fn escape<'scope, F, R>(&'scope self, f: F) -> Local<'scope, R>
     where
-        F: for<'id> FnOnce(Scope<'id>) -> R,
+        F: for<'id> FnOnce(&'id Scope<'ctx>, LocalMut<'scope, R>),
     {
-        let handle_scope = unsafe { Scope::new(self.scope_data, self.allocator) };
-        f(handle_scope)
+        unsafe {
+            let out = LocalMut::new(self);
+            let slot = out.slot;
+            let scope = Scope::new(self.scope_data, self.allocator);
+            f(&scope, out);
+            Local {
+                slot,
+                lifetime: PhantomData,
+            }
+        }
     }
 
     #[inline]
-    pub fn alloc<T: Trace>(&self, data: T) -> Local<'_, T> {
+    pub fn scope<F>(&self, f: F)
+    where
+        F: for<'id> FnOnce(&'id Scope<'ctx>),
+    {
+        let scope = unsafe { Scope::new(self.scope_data, self.allocator) };
+        f(&scope);
+    }
+
+    #[inline]
+    pub fn alloc<'scope, T: Trace + 'scope>(&'scope self, data: T) -> Local<'scope, T> {
         unsafe {
             // TODO: trigger GC here if heap is somewhat full
+            if (*self.allocator).config.stress {
+                // stress-test the GC by running it before every allocation
+                super::gc::gc(self.scope_data, self.allocator);
+            }
 
             assert_eq!(
                 self.level + 1,
@@ -181,6 +203,16 @@ impl<'ctx> Scope<'ctx> {
             let ptr = (*self.allocator).alloc(data);
             Local::new(self, ptr)
         }
+    }
+
+    #[inline]
+    pub(crate) fn scope_data(&self) -> *mut ScopeData {
+        self.scope_data
+    }
+
+    #[inline]
+    pub(crate) fn allocator(&self) -> *mut Allocator {
+        self.allocator
     }
 }
 
@@ -212,15 +244,66 @@ impl<'ctx> Drop for Scope<'ctx> {
     }
 }
 
+pub struct LocalMut<'to, T> {
+    pub(crate) slot: *mut HeapRef<T>,
+
+    lifetime: PhantomData<fn(&'to ()) -> &'to ()>,
+}
+
+impl<'to, T> LocalMut<'to, T> {
+    pub(crate) fn new(scope: &Scope) -> Self {
+        unsafe {
+            Self {
+                slot: Local::new(scope, null_mut()).slot,
+                lifetime: PhantomData,
+            }
+        }
+    }
+
+    pub fn set(self, to: Local<'_, T>) {
+        unsafe {
+            *self.slot = *to.slot;
+        }
+    }
+}
+
+pub struct Heap<'scope, T> {
+    pub(crate) ptr: HeapRef<T>,
+
+    lifetime: PhantomData<fn(&'scope T) -> &'scope T>,
+}
+
+impl<'scope, T> Clone for Heap<'scope, T> {
+    #[allow(clippy::non_canonical_clone_impl)]
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            lifetime: PhantomData,
+        }
+    }
+}
+
+impl<'scope, T> Copy for Heap<'scope, T> {}
+
+impl<'scope, T> Heap<'scope, T>
+where
+    T: Trace + 'scope,
+{
+    pub fn to_local(self, scope: &'scope Scope<'_>) -> Local<'scope, T> {
+        unsafe { Local::new(scope, self.ptr) }
+    }
+}
+
 pub struct Local<'scope, T> {
     /// Pointer to the handle slot which contains the actual memory location of `T`.
-    slot: *mut Opaque,
+    slot: *mut HeapRef<T>,
 
     lifetime: PhantomData<fn(&'scope T) -> &'scope T>,
 }
 
 impl<'scope, T> Local<'scope, T> {
-    pub(crate) unsafe fn new(scope: &'scope Scope<'_>, ptr: *mut GcCell<T>) -> Self {
+    pub(crate) unsafe fn new(scope: &'scope Scope<'_>, ptr: HeapRef<T>) -> Self {
         // Grow if needed
         let scope_data = scope.scope_data;
         if (*scope_data).next == (*scope_data).limit {
@@ -232,7 +315,8 @@ impl<'scope, T> Local<'scope, T> {
         (*scope_data).next = (*scope_data).next.add(1);
 
         // Initialize the slot
-        *slot = ptr as Opaque;
+        let slot = slot.cast::<HeapRef<T>>();
+        *slot = ptr;
 
         debug!(
             "{slot:p} = {ptr:p}, next = {next:p}",
@@ -244,12 +328,52 @@ impl<'scope, T> Local<'scope, T> {
             lifetime: PhantomData,
         }
     }
+
+    pub fn to_heap(self) -> Heap<'scope, T> {
+        unsafe {
+            Heap {
+                ptr: self.slot.read().cast::<GcCell<T>>(),
+                lifetime: PhantomData,
+            }
+        }
+    }
+
+    pub fn escape<'to>(&self, out: LocalMut<'to, T::To>)
+    where
+        T: Escape<'scope, 'to>,
+    {
+        unsafe {
+            <T as Escape>::move_to(*self, out);
+        }
+    }
 }
 
-impl<'scope, T> Deref for Local<'scope, T> {
+pub trait Escape<'from, 'to>: Sized + 'from {
+    type To: 'to;
+
+    /// # Safety
+    /// The implementor must transmute the lifetime `'from` to `'to`,
+    /// and then immediately call `out.set(this)`.
+    unsafe fn move_to(this: Local<'from, Self>, out: LocalMut<'to, Self::To>);
+}
+
+impl<'scope, T: Trace> Deref for Local<'scope, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { &*(self.slot.read().cast::<T>()) }
+        unsafe { &*GcCell::data(self.slot.read()) }
     }
 }
+
+impl<'scope, T> Clone for Local<'scope, T> {
+    #[allow(clippy::non_canonical_clone_impl)]
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            slot: self.slot,
+            lifetime: PhantomData,
+        }
+    }
+}
+
+impl<'scope, T> Copy for Local<'scope, T> {}

@@ -8,15 +8,17 @@ use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
 use std::ptr::null_mut;
 
-pub struct Allocator {
+pub(crate) struct Allocator {
     pub(crate) head: Cell<*mut GcCell<Data>>,
+    pub(crate) config: Config,
 }
 
 impl Allocator {
     #[inline]
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
         Self {
             head: Cell::new(null_mut()),
+            config,
         }
     }
 
@@ -32,8 +34,28 @@ impl Allocator {
         }));
         debug!("alloc {ptr:p}");
 
+        // TODO: maybe use `next` pointers instead of `prev`,
+        // so the head doesn't need to be updated constantly?
         self.head.set(GcCell::erase(ptr));
         ptr
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Config {
+    pub stress: bool,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for Config {
+    #[cfg(test)]
+    fn default() -> Self {
+        Self { stress: true }
+    }
+
+    #[cfg(not(test))]
+    fn default() -> Self {
+        Self { stress: false }
     }
 }
 
@@ -46,6 +68,10 @@ impl<T: Trace> GcCell<T> {
     #[inline]
     pub(crate) fn erase(ptr: *mut Self) -> *mut GcCell<Data> {
         ptr as _
+    }
+
+    pub(crate) unsafe fn data(this: *mut Self) -> *mut T {
+        addr_of_mut!((*this).data)
     }
 }
 
@@ -165,7 +191,7 @@ impl Vt {
                         size: size_of::<T>(),
                         align: align_of::<T>(),
                         #[cfg(miri)]
-                        trace: transmute::<fn(&T), fn(*const Data)>(<T as Trace>::trace),
+                        trace: transmute::<unsafe fn(&T), fn(*const Data)>(<T as Trace>::trace),
                     }
                 };
             }
@@ -194,10 +220,10 @@ mod tests {
         }
 
         impl Trace for Test {
-            fn trace(&self) {}
+            unsafe fn trace(&self) {}
         }
 
-        let cx = Allocator::new();
+        let cx = Allocator::new(Config::default());
         let v = Test {
             value: "test".to_owned(),
         };
@@ -215,12 +241,12 @@ mod tests {
 
         struct Test {}
         impl Trace for Test {
-            fn trace(&self) {
+            unsafe fn trace(&self) {
                 TRACED.store(true, Ordering::SeqCst);
             }
         }
 
-        let cx = Allocator::new();
+        let cx = Allocator::new(Config::default());
         let v = cx.alloc(Test {});
         unsafe { GcCell::trace(GcCell::erase(v)) }
 
