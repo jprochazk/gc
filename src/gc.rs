@@ -474,6 +474,8 @@ mod tests {
             // `4` is now unreachable, and will be collected during the next GC:
             cx.collect();
 
+            assert!(COLLECTED_NODES.with_borrow(|v| v == &[4]));
+
             // rotating through a circular list will yield the same values N times:
             cx.scope(|cx| {
                 let mut root = root.move_to(cx).to_heap();
