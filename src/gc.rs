@@ -7,7 +7,7 @@ use std::ptr::null_mut;
 
 pub trait Trace {
     /// # Safety
-    /// This method is unsafe to implement, because the implementation _must_ trace all interior references.
+    /// The implementation _must_ trace all interior references.
     unsafe fn trace(&self);
 }
 
