@@ -390,6 +390,7 @@ where
     }
 }
 
+#[doc(hidden)]
 pub unsafe trait Escape<'from, 'to>: Sized + 'from {
     type To: 'to;
 
