@@ -390,14 +390,9 @@ where
     }
 }
 
-/// # Safety
-/// The implementor must guarantee that `'from` and `'to` only refer to `'gc` lifetimes.
 pub unsafe trait Escape<'from, 'to>: Sized + 'from {
     type To: 'to;
 
-    /// # Safety
-    /// The implementor must transmute the lifetime `'from` to `'to`,
-    /// and then immediately call `out.set(this)`.
     unsafe fn move_to(this: Local<'from, Self>, out: EscapeSlot<'to, Self::To>);
 }
 
