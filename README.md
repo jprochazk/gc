@@ -7,7 +7,6 @@ Experimenting with a safe Rust GC design based on V8's handle scope concept.
 ```rust
 let cx = Gc::new();
 
-// Uses generative lifetimes to ensure references on the stack don't escape their scope
 cx.scope(|cx| {
   // Values are allocated on the heap, and returned as lightweight handles.
   // These handles can be freely copied, and implement `Deref<Target = T>`.
