@@ -8,33 +8,37 @@ Experimenting with a safe Rust GC design based on V8's handle scope concept.
 let cx = Gc::new();
 
 // Uses generative lifetimes to ensure references on the stack don't escape their scope
-cx.scope(|s| {
-  // Values are allocated on the heap, and returned as lightweight handles
-  // These handles can be freely passed around, and implement `Deref<Target = T>`.
-  let a: Local<Value> = s.alloc(Value);
+cx.scope(|cx| {
+  // Values are allocated on the heap, and returned as lightweight handles.
+  // These handles can be freely copied, and implement `Deref<Target = T>`.
+  let a: Local<Value> = cx.alloc(Value);
 
   // Every call to `alloc` may trigger a GC cycle, even if there are live references.
-  let b: Local<Value> = s.alloc(Value);
-})
+  let b: Local<Value> = cx.alloc(Value);
+});
 ```
 
-## TODO
-
-The API for storing GC'd references in objects is not yet implemented. It still needs some design work to make it ergonomic, but the fundamental concept _should_ be sound:
-
+It's possible to place object references into other objects:
 ```rust
 #[trace]
-struct Thing<'gc> {
-  value: Heap<'gc, Value>,
+struct Test {
+  value: u32,
 }
 
-cx.scope(|s| {
-  let thing = s.alloc(Thing {
-    value: s.alloc(Value).into()
-  });
+#[trace]
+struct Compound<'gc> {
+  a: Heap<'gc, Test>,
+}
 
-  // `Heap` does not implement `Deref`.
-  // In order to dereference a `Heap`, you must first root it in some scope:
-  let value: Local<'_, Value> = thing.value.root(s);
-})
+// Compound values may only contain references stored as `Heap<T>`.
+let v = cx.alloc(Compound {
+  a: cx.alloc(Test { value: 100 }).to_heap(),
+});
+
+// `Heap<T>` can't be accessed directly,
+// it must first be turned into a `Local` in some scope:
+let a = v.a.to_local(cx);
+
+// and now it's safe to access:
+println!("{}", a.value);
 ```
