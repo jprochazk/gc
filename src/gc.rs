@@ -36,12 +36,9 @@ impl Gc {
         }
     }
 
-    pub(crate) fn scope_data(&self) -> *mut ScopeData {
-        self.scope_data.get()
-    }
-
-    pub(crate) fn allocator(&self) -> *mut Allocator {
-        self.allocator.get()
+    #[inline]
+    pub fn collect(&self) {
+        gc(self.scope_data.get(), self.allocator.get())
     }
 }
 
@@ -224,9 +221,9 @@ impl<T: Trace> Trace for std::cell::RefCell<T> {
 mod tests {
     use super::*;
     use crate::handle::Escape;
+    use crate::handle::EscapeSlot;
     use crate::handle::Heap;
     use crate::handle::Local;
-    use crate::handle::LocalMut;
     use std::cell::RefCell;
 
     struct Test {
@@ -270,7 +267,7 @@ mod tests {
             assert_eq!(c.value, 400);
         });
 
-        gc(cx.scope_data(), cx.allocator());
+        cx.collect();
     }
 
     #[test]
@@ -315,7 +312,7 @@ mod tests {
             assert_eq!(a.value + c.value + f.value, 1000);
 
             // run the GC while A, C, F are live
-            gc(cx.scope_data(), cx.allocator());
+            cx.collect();
         });
     }
 
@@ -345,6 +342,10 @@ mod tests {
         })
     }
 
+    thread_local! {
+        static COLLECTED_NODES: RefCell<Vec<u32>> = const { RefCell::new(vec![]) };
+    }
+
     struct Node<'gc> {
         prev: RefCell<Option<Heap<'gc, Node<'gc>>>>,
         next: RefCell<Option<Heap<'gc, Node<'gc>>>>,
@@ -365,6 +366,12 @@ mod tests {
                 next: RefCell::new(None),
                 value,
             })
+        }
+    }
+
+    impl<'gc> Drop for Node<'gc> {
+        fn drop(&mut self) {
+            COLLECTED_NODES.with_borrow_mut(|v| v.push(self.value));
         }
     }
 
@@ -391,10 +398,10 @@ mod tests {
         }
     }
 
-    impl<'from, 'to> Escape<'from, 'to> for Node<'from> {
+    unsafe impl<'from, 'to> Escape<'from, 'to> for Node<'from> {
         type To = Node<'to>;
 
-        unsafe fn move_to(this: Local<'from, Self>, out: LocalMut<'to, Self::To>) {
+        unsafe fn move_to(this: Local<'from, Self>, out: EscapeSlot<'to, Self::To>) {
             let this = std::mem::transmute::<Local<'from, Self>, Local<'to, Self::To>>(this);
             out.set(this);
         }
@@ -406,12 +413,87 @@ mod tests {
 
         cx.scope(|cx| {
             let escaped = cx.escape(|cx, out| {
-                Node::new(cx, 100).escape(out);
+                Node::new(cx, 100).move_to(out);
             });
 
-            gc(cx.scope_data(), cx.allocator());
+            cx.collect();
 
             assert_eq!(escaped.value, 100);
         });
     }
+
+    #[test]
+    fn doubly_linked_list() {
+        COLLECTED_NODES.with_borrow_mut(|v| v.clear());
+
+        let cx = Gc::default();
+
+        cx.scope(|cx| {
+            // 1 <-> 2 <-> 3 <-> 4
+            let root = cx.escape(|cx, out| {
+                let one = Node::new(cx, 1);
+                let two = Node::new(cx, 2);
+                let three = Node::new(cx, 3);
+                let four = Node::new(cx, 4);
+
+                node_join(one, two);
+                node_join(two, three);
+                node_join(three, four);
+
+                one.move_to(out);
+            });
+
+            // check that we can traverse the linked list in both directions
+            cx.scope(|cx| {
+                // TODO: allow reusing the same local slot
+                let mut root = root.move_to(cx).to_heap();
+                for i in 1..=4 {
+                    assert_eq!(root.to_local(cx).value, i);
+                    node_rotate_right(cx, &mut root);
+                }
+                for i in (1..=4).rev() {
+                    assert_eq!(root.to_local(cx).value, i);
+                    node_rotate_left(cx, &mut root);
+                }
+            });
+
+            // make the list circular, and remove reference to `4`
+            cx.scope(|cx| {
+                // from:
+                //     1 <-> 2 <-> 3 <-> 4
+                // to:
+                // +-> 1 <-> 2 <-> 3 <-+ 4
+                // |___________________|
+
+                let one = root.move_to(cx);
+                let two = one.next.borrow().unwrap().to_local(cx);
+                let three = two.next.borrow().unwrap().to_local(cx);
+                node_join(three, one);
+            });
+
+            // `4` is now unreachable, and will be collected during the next GC:
+            cx.collect();
+
+            // rotating through a circular list will yield the same values N times:
+            cx.scope(|cx| {
+                let mut root = root.move_to(cx).to_heap();
+                for _ in 0..2 {
+                    for i in 1..=3 {
+                        assert_eq!(root.to_local(cx).value, i);
+                        assert!(node_rotate_right(cx, &mut root));
+                    }
+                }
+            })
+        });
+    }
+
+    /* fn _test_compile_fail() {
+        let cx = Gc::default();
+
+        let mut out: Local<'_, Test> = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+        cx.scope(|cx| {
+            out = cx.alloc(Test { value: 100 });
+            cx.scope(|cx| {})
+        })
+    } */
 }

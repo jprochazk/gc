@@ -9,7 +9,11 @@ fn type_name_of<T>(_: T) -> &'static str {
 macro_rules! __function {
     () => {{
         fn f() {}
-        $crate::type_name_of(f).strip_suffix("::f").unwrap()
+        let mut name = $crate::type_name_of(f).strip_suffix("::f").unwrap();
+        while let Some(v) = name.strip_suffix("::{{closure}}") {
+            name = v;
+        }
+        name
     }};
 }
 

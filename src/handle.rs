@@ -31,6 +31,7 @@
 use crate::alloc::Allocator;
 use crate::alloc::Data;
 use crate::alloc::GcCell;
+use crate::gc::gc;
 use crate::gc::Trace;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -163,11 +164,11 @@ impl<'ctx> Scope<'ctx> {
     #[inline]
     pub fn escape<'scope, F, R>(&'scope self, f: F) -> Local<'scope, R>
     where
-        F: for<'id> FnOnce(&'id Scope<'ctx>, LocalMut<'scope, R>),
+        F: for<'id> FnOnce(&'id Scope<'ctx>, EscapeSlot<'scope, R>),
+        R: 'scope,
     {
         unsafe {
-            let out = LocalMut::new(self);
-            let slot = out.slot;
+            let (out, slot) = EscapeSlot::new(self);
             let scope = Scope::new(self.scope_data, self.allocator);
             f(&scope, out);
             Local {
@@ -182,8 +183,9 @@ impl<'ctx> Scope<'ctx> {
     where
         F: for<'id> FnOnce(&'id Scope<'ctx>),
     {
-        let scope = unsafe { Scope::new(self.scope_data, self.allocator) };
-        f(&scope);
+        unsafe {
+            f(&Scope::new(self.scope_data, self.allocator));
+        };
     }
 
     #[inline]
@@ -205,14 +207,10 @@ impl<'ctx> Scope<'ctx> {
         }
     }
 
+    /// Trigger a GC cycle.
     #[inline]
-    pub(crate) fn scope_data(&self) -> *mut ScopeData {
-        self.scope_data
-    }
-
-    #[inline]
-    pub(crate) fn allocator(&self) -> *mut Allocator {
-        self.allocator
+    pub fn collect(&self) {
+        gc(self.scope_data, self.allocator)
     }
 }
 
@@ -244,19 +242,23 @@ impl<'ctx> Drop for Scope<'ctx> {
     }
 }
 
-pub struct LocalMut<'to, T> {
+pub struct EscapeSlot<'to, T> {
     pub(crate) slot: *mut HeapRef<T>,
 
     lifetime: PhantomData<fn(&'to ()) -> &'to ()>,
 }
 
-impl<'to, T> LocalMut<'to, T> {
-    pub(crate) fn new(scope: &Scope) -> Self {
+impl<'to, T> EscapeSlot<'to, T> {
+    pub(crate) fn new(scope: &Scope) -> (Self, *mut HeapRef<T>) {
         unsafe {
-            Self {
-                slot: Local::new(scope, null_mut()).slot,
-                lifetime: PhantomData,
-            }
+            let slot = Local::new(scope, null_mut()).slot;
+            (
+                Self {
+                    slot,
+                    lifetime: PhantomData,
+                },
+                slot,
+            )
         }
     }
 
@@ -286,11 +288,9 @@ impl<'scope, T> Clone for Heap<'scope, T> {
 
 impl<'scope, T> Copy for Heap<'scope, T> {}
 
-impl<'scope, T> Heap<'scope, T>
-where
-    T: Trace + 'scope,
-{
-    pub fn to_local(self, scope: &'scope Scope<'_>) -> Local<'scope, T> {
+impl<'scope, T> Heap<'scope, T> {
+    #[inline]
+    pub fn to_local<'new_scope>(self, scope: &'new_scope Scope<'_>) -> Local<'new_scope, T> {
         unsafe { Local::new(scope, self.ptr) }
     }
 }
@@ -332,29 +332,73 @@ impl<'scope, T> Local<'scope, T> {
     pub fn to_heap(self) -> Heap<'scope, T> {
         unsafe {
             Heap {
-                ptr: self.slot.read().cast::<GcCell<T>>(),
+                ptr: *self.slot,
                 lifetime: PhantomData,
             }
         }
     }
 
-    pub fn escape<'to>(&self, out: LocalMut<'to, T::To>)
+    pub fn move_to<'to, Place>(&self, out: Place) -> Place::Out
     where
         T: Escape<'scope, 'to>,
+        Place: PlaceFor<'scope, 'to, T>,
     {
-        unsafe {
-            <T as Escape>::move_to(*self, out);
+        unsafe { out.accept(*self) }
+    }
+}
+
+#[doc(hidden)]
+pub trait PlaceFor<'from, 'to, T>: private::Sealed
+where
+    T: Escape<'from, 'to>,
+{
+    type Out: 'to;
+
+    unsafe fn accept(self, v: Local<'from, T>) -> Self::Out;
+}
+
+mod private {
+    pub trait Sealed {}
+}
+
+impl<'to, T> private::Sealed for EscapeSlot<'to, T> {}
+impl<'from, 'to, T> PlaceFor<'from, 'to, T> for EscapeSlot<'to, <T as Escape<'from, 'to>>::To>
+where
+    T: Escape<'from, 'to>,
+{
+    type Out = ();
+
+    unsafe fn accept(self, v: Local<'from, T>) -> Self::Out {
+        <T as Escape>::move_to(v, self)
+    }
+}
+
+impl<'to, 'ctx> private::Sealed for &'to Scope<'ctx> {}
+impl<'from, 'to, 'ctx, T> PlaceFor<'from, 'to, T> for &'to Scope<'ctx>
+where
+    T: Escape<'from, 'to>,
+{
+    type Out = Local<'to, T::To>;
+
+    unsafe fn accept(self, v: Local<'from, T>) -> Self::Out {
+        let (out, slot) = EscapeSlot::new(self);
+        <T as Escape>::move_to(v, out);
+        Local {
+            slot,
+            lifetime: PhantomData,
         }
     }
 }
 
-pub trait Escape<'from, 'to>: Sized + 'from {
+/// # Safety
+/// The implementor must guarantee that `'from` and `'to` only refer to `'gc` lifetimes.
+pub unsafe trait Escape<'from, 'to>: Sized + 'from {
     type To: 'to;
 
     /// # Safety
     /// The implementor must transmute the lifetime `'from` to `'to`,
     /// and then immediately call `out.set(this)`.
-    unsafe fn move_to(this: Local<'from, Self>, out: LocalMut<'to, Self::To>);
+    unsafe fn move_to(this: Local<'from, Self>, out: EscapeSlot<'to, Self::To>);
 }
 
 impl<'scope, T: Trace> Deref for Local<'scope, T> {
