@@ -42,3 +42,5 @@ let a = v.a.to_local(cx);
 // and now it's safe to access:
 println!("{}", a.value);
 ```
+
+See [this post](docs/what.md) for more information about how it works.
