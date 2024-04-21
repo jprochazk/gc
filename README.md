@@ -43,4 +43,5 @@ let a = v.a.to_local(cx);
 println!("{}", a.value);
 ```
 
-See [this post](docs/what.md) for more information about how it works.
+Documentation and `SAFETY` comments in this repository are quite sparse at the moment,
+see [this post](docs/what.md) for more information about how it works.
