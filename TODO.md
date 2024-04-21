@@ -8,3 +8,7 @@
     store heap refs originating in that scope, whether they were moved in or not.
     It's allocating a new handle is not completely free, and if you have a loop where you allocate a bunch, it may
     be better to instead reuse the same slot. 
+- [ ] write derive macro for deriving `Trace` and `Escape`
+  - these should never be implemented manually outside of niche use cases, because doing it incorrectly means
+    undefined behavior. that's why both the trait and fn inside are `unsafe`.
+    having a proc macro do this for the user is essential.
