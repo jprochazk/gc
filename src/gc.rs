@@ -398,11 +398,11 @@ mod tests {
         }
     }
 
-    unsafe impl<'from, 'to> Escape<'from, 'to> for Node<'from> {
+    unsafe impl<'to> Escape<'to> for Node<'_> {
         type To = Node<'to>;
 
-        unsafe fn move_to(this: Local<'from, Self>, out: EscapeSlot<'to, Self::To>) {
-            let this = std::mem::transmute::<Local<'from, Self>, Local<'to, Self::To>>(this);
+        unsafe fn move_to(this: Local<'_, Self>, out: EscapeSlot<'to, Self::To>) {
+            let this = std::mem::transmute::<Local<Self>, Local<'to, Self::To>>(this);
             out.set(this);
         }
     }
@@ -412,8 +412,9 @@ mod tests {
         let cx = Gc::default();
 
         cx.scope(|cx| {
-            let escaped = cx.escape(|cx, out| {
-                Node::new(cx, 100).move_to(out);
+            let escaped = cx.escape(|cx| {
+                let v = Node::new(cx, 100);
+                v
             });
 
             cx.collect();
@@ -430,7 +431,7 @@ mod tests {
 
         cx.scope(|cx| {
             // 1 <-> 2 <-> 3 <-> 4
-            let root = cx.escape(|cx, out| {
+            let root = cx.escape(|cx| {
                 let one = Node::new(cx, 1);
                 let two = Node::new(cx, 2);
                 let three = Node::new(cx, 3);
@@ -440,7 +441,7 @@ mod tests {
                 node_join(two, three);
                 node_join(three, four);
 
-                one.move_to(out);
+                one
             });
 
             // check that we can traverse the linked list in both directions

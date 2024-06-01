@@ -162,15 +162,23 @@ impl<'ctx> Scope<'ctx> {
     }
 
     #[inline]
-    pub fn escape<'scope, F, R>(&'scope self, f: F) -> Local<'scope, R>
+    pub fn escape<'scope, F, R, T>(&'scope self, f: F) -> Local<'scope, T>
     where
-        F: for<'id> FnOnce(&'id Scope<'ctx>, EscapeSlot<'scope, R>),
-        R: 'scope,
+        F: for<'id> FnOnce(&'id Scope<'ctx>) -> Local<'id, R>,
+        R: Escape<'scope, To = T>,
     {
         unsafe {
-            let (out, slot) = EscapeSlot::new(self);
+            // allocate a handle in the current scope
+            let place = EscapeSlot::<'scope, T>::new(self);
+            let slot = place.slot;
+
+            // enter a new scope
             let scope = Scope::new(self.scope_data, self.allocator);
-            f(&scope, out);
+            let escapee = f(&scope);
+
+            // move the value from inner to outer
+            place.accept(escapee);
+
             Local {
                 slot,
                 lifetime: PhantomData,
@@ -249,16 +257,12 @@ pub struct EscapeSlot<'to, T> {
 }
 
 impl<'to, T> EscapeSlot<'to, T> {
-    pub(crate) fn new(scope: &Scope) -> (Self, *mut HeapRef<T>) {
+    pub(crate) fn new(scope: &Scope) -> Self {
         unsafe {
-            let slot = Local::new(scope, null_mut()).slot;
-            (
-                Self {
-                    slot,
-                    lifetime: PhantomData,
-                },
-                slot,
-            )
+            Self {
+                slot: Local::new(scope, null_mut()).slot,
+                lifetime: PhantomData,
+            }
         }
     }
 
@@ -340,21 +344,21 @@ impl<'scope, T> Local<'scope, T> {
 
     pub fn move_to<'to, Place>(&self, out: Place) -> Place::Out
     where
-        T: Escape<'scope, 'to>,
-        Place: PlaceFor<'scope, 'to, T>,
+        T: Escape<'to>,
+        Place: PlaceFor<'to, T>,
     {
         unsafe { out.accept(*self) }
     }
 }
 
 #[doc(hidden)]
-pub trait PlaceFor<'from, 'to, T>: private::Sealed
+pub trait PlaceFor<'to, T>: private::Sealed
 where
-    T: Escape<'from, 'to>,
+    T: Escape<'to>,
 {
     type Out: 'to;
 
-    unsafe fn accept(self, v: Local<'from, T>) -> Self::Out;
+    unsafe fn accept(self, v: Local<'_, T>) -> Self::Out;
 }
 
 mod private {
@@ -362,27 +366,28 @@ mod private {
 }
 
 impl<'to, T> private::Sealed for EscapeSlot<'to, T> {}
-impl<'from, 'to, T> PlaceFor<'from, 'to, T> for EscapeSlot<'to, <T as Escape<'from, 'to>>::To>
+impl<'to, T> PlaceFor<'to, T> for EscapeSlot<'to, <T as Escape<'to>>::To>
 where
-    T: Escape<'from, 'to>,
+    T: Escape<'to>,
 {
     type Out = ();
 
-    unsafe fn accept(self, v: Local<'from, T>) -> Self::Out {
+    unsafe fn accept(self, v: Local<'_, T>) -> Self::Out {
         <T as Escape>::move_to(v, self)
     }
 }
 
 impl<'to, 'ctx> private::Sealed for &'to Scope<'ctx> {}
-impl<'from, 'to, 'ctx, T> PlaceFor<'from, 'to, T> for &'to Scope<'ctx>
+impl<'to, 'ctx, T> PlaceFor<'to, T> for &'to Scope<'ctx>
 where
-    T: Escape<'from, 'to>,
+    T: Escape<'to>,
 {
     type Out = Local<'to, T::To>;
 
-    unsafe fn accept(self, v: Local<'from, T>) -> Self::Out {
-        let (out, slot) = EscapeSlot::new(self);
-        <T as Escape>::move_to(v, out);
+    unsafe fn accept(self, v: Local<'_, T>) -> Self::Out {
+        let place = EscapeSlot::new(self);
+        let slot = place.slot;
+        <T as Escape>::move_to(v, place);
         Local {
             slot,
             lifetime: PhantomData,
@@ -391,10 +396,10 @@ where
 }
 
 #[doc(hidden)]
-pub unsafe trait Escape<'from, 'to>: Sized + 'from {
+pub unsafe trait Escape<'to>: Sized {
     type To: 'to;
 
-    unsafe fn move_to(this: Local<'from, Self>, out: EscapeSlot<'to, Self::To>);
+    unsafe fn move_to<'from>(this: Local<'from, Self>, out: EscapeSlot<'to, Self::To>);
 }
 
 impl<'scope, T: Trace> Deref for Local<'scope, T> {
