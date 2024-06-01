@@ -220,10 +220,10 @@ impl<T: Trace> Trace for std::cell::RefCell<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle::Escape;
-    use crate::handle::EscapeSlot;
     use crate::handle::Heap;
     use crate::handle::Local;
+    use crate::handle::LocalMut;
+    use crate::handle::TransmuteLifetime;
     use std::cell::RefCell;
 
     struct Test {
@@ -352,13 +352,6 @@ mod tests {
         value: u32,
     }
 
-    impl<'gc> Trace for Node<'gc> {
-        unsafe fn trace(&self) {
-            self.prev.trace();
-            self.next.trace();
-        }
-    }
-
     impl<'gc> Node<'gc> {
         fn new(cx: &'gc Scope<'_>, value: u32) -> Local<'gc, Node<'gc>> {
             cx.alloc(Node {
@@ -367,6 +360,17 @@ mod tests {
                 value,
             })
         }
+    }
+
+    impl<'gc> Trace for Node<'gc> {
+        unsafe fn trace(&self) {
+            self.prev.trace();
+            self.next.trace();
+        }
+    }
+
+    unsafe impl<'gc> TransmuteLifetime for Node<'gc> {
+        type Output<'a> = Node<'a>;
     }
 
     impl<'gc> Drop for Node<'gc> {
@@ -380,30 +384,23 @@ mod tests {
         *right.prev.borrow_mut() = Some(left.to_heap());
     }
 
-    fn node_rotate_right<'gc>(scope: &'gc Scope<'_>, node: &mut Heap<'gc, Node<'gc>>) -> bool {
-        if let Some(next) = node.to_local(scope).next.borrow().as_ref() {
-            *node = *next;
+    fn node_rotate_right<'gc>(node: &mut LocalMut<'gc, Node<'gc>>) -> bool {
+        let next = *node.next.borrow();
+        if let Some(next) = next {
+            next.move_to(node);
             true
         } else {
             false
         }
     }
 
-    fn node_rotate_left<'gc>(scope: &'gc Scope<'_>, node: &mut Heap<'gc, Node<'gc>>) -> bool {
-        if let Some(prev) = node.to_local(scope).prev.borrow().as_ref() {
-            *node = *prev;
+    fn node_rotate_left<'gc>(node: &mut LocalMut<'gc, Node<'gc>>) -> bool {
+        let prev = *node.prev.borrow();
+        if let Some(prev) = prev {
+            prev.move_to(node);
             true
         } else {
             false
-        }
-    }
-
-    unsafe impl<'from, 'to> Escape<'from, 'to> for Node<'from> {
-        type To = Node<'to>;
-
-        unsafe fn move_to(this: Local<'from, Self>, out: EscapeSlot<'to, Self::To>) {
-            let this = std::mem::transmute::<Local<'from, Self>, Local<'to, Self::To>>(this);
-            out.set(this);
         }
     }
 
@@ -412,13 +409,11 @@ mod tests {
         let cx = Gc::default();
 
         cx.scope(|cx| {
-            let escaped = cx.escape(|cx, out| {
-                Node::new(cx, 100).move_to(out);
-            });
+            let node = cx.escape(|cx| Node::new(cx, 1));
 
             cx.collect();
 
-            assert_eq!(escaped.value, 100);
+            assert_eq!(node.value, 100);
         });
     }
 
@@ -430,7 +425,8 @@ mod tests {
 
         cx.scope(|cx| {
             // 1 <-> 2 <-> 3 <-> 4
-            let root = cx.escape(|cx, out| {
+            let mut root = cx.empty_slot();
+            cx.scope(|cx| {
                 let one = Node::new(cx, 1);
                 let two = Node::new(cx, 2);
                 let three = Node::new(cx, 3);
@@ -440,20 +436,21 @@ mod tests {
                 node_join(two, three);
                 node_join(three, four);
 
-                one.move_to(out);
+                root.set(one);
             });
+            let root = root.get().unwrap();
 
             // check that we can traverse the linked list in both directions
             cx.scope(|cx| {
                 // TODO: allow reusing the same local slot
-                let mut root = root.move_to(cx).to_heap();
+                let mut root = root.in_scope_mut(cx);
                 for i in 1..=4 {
-                    assert_eq!(root.to_local(cx).value, i);
-                    node_rotate_right(cx, &mut root);
+                    assert_eq!(root.value, i);
+                    node_rotate_right(&mut root);
                 }
                 for i in (1..=4).rev() {
-                    assert_eq!(root.to_local(cx).value, i);
-                    node_rotate_left(cx, &mut root);
+                    assert_eq!(root.value, i);
+                    node_rotate_left(&mut root);
                 }
             });
 
@@ -465,7 +462,7 @@ mod tests {
                 // +-> 1 <-> 2 <-> 3 <-+ 4
                 // |___________________|
 
-                let one = root.move_to(cx);
+                let one = root.in_scope(cx);
                 let two = one.next.borrow().unwrap().to_local(cx);
                 let three = two.next.borrow().unwrap().to_local(cx);
                 node_join(three, one);
@@ -478,11 +475,11 @@ mod tests {
 
             // rotating through a circular list will yield the same values N times:
             cx.scope(|cx| {
-                let mut root = root.move_to(cx).to_heap();
+                let mut root = root.in_scope_mut(cx);
                 for _ in 0..2 {
                     for i in 1..=3 {
-                        assert_eq!(root.to_local(cx).value, i);
-                        assert!(node_rotate_right(cx, &mut root));
+                        assert_eq!(root.value, i);
+                        assert!(node_rotate_right(&mut root));
                     }
                 }
             })
