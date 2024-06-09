@@ -55,8 +55,40 @@ type Covariant<'a, T = ()> = PhantomData<&'a T>;
 
 pub trait Object: Sized + 'static {}
 
-// TODO: when dropping a scope, mark it as a zombie instead of freeing it
-//       when using a scope, ensure it is the top scope + free all zombie scopes above it
+/*
+TODO: zombie scopes
+
+currently, users could run into use-after-frees:
+
+```
+let parent = &mut Scope::new(...);
+let value = {
+    let child = &mut Scope::new(parent);
+    Local::new(child, ...)
+    // `child` is dropped here
+}
+
+// `value` is still reachable, but it will be freed if we trigger a collection now:
+// this is because `scope_data.next` is reset to `parent.next` when `child` is dropped
+// and `parent.next < value.slot`.
+collect();
+
+// we can still use `value`, but it is now a dangling pointer:
+value.asdf();
+```
+
+to fix this, introduce the concept of a "zombie" scope.
+a zombie scope is a scope that has been dropped, but locals
+within it are still considered reachable.
+
+instead of tracking just `scope_data.next`, we also track `scope_data.tombstone`.
+when a scope is dropped, it will set `scope_data.tombstone = scope_data.next`
+before setting `scope_data.next = parent.next`.
+
+`ScopeDataIter` will traverse until `max(tombstone, next)` instead of just `next`.
+
+*/
+
 pub struct ScopeData {
     /// Next available slot in the current block.
     ///
@@ -245,7 +277,7 @@ impl<'ctx> Drop for Scope<'ctx> {
             (*scope_data).level -= 1;
 
             debug!(
-                "data.next={next:p}, data.level={level}",
+                "data.next={next:p}, data.level={level}",3
                 next = (*scope_data).next,
                 level = (*scope_data).level
             );
