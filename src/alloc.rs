@@ -8,14 +8,14 @@ use std::ptr::addr_of;
 use std::ptr::addr_of_mut;
 use std::ptr::null_mut;
 
-pub(crate) struct Allocator {
+pub struct Allocator {
     pub(crate) head: Cell<*mut GcCell<Data>>,
     pub(crate) config: Config,
 }
 
 impl Allocator {
     #[inline]
-    pub fn new(config: Config) -> Self {
+    pub(crate) fn new(config: Config) -> Self {
         Self {
             head: Cell::new(null_mut()),
             config,
@@ -23,7 +23,7 @@ impl Allocator {
     }
 
     #[inline]
-    pub fn alloc<T: Trace>(&self, data: T) -> *mut GcCell<T> {
+    pub(crate) fn alloc<T: Trace>(&self, data: T) -> *mut GcCell<T> {
         let ptr = Box::into_raw(Box::new(GcCell {
             header: GcHeader {
                 prev: UnsafeCell::new(self.head.get()),

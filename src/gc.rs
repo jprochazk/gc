@@ -1,19 +1,19 @@
 use crate::alloc::Allocator;
 use crate::alloc::GcCell;
-use crate::handle::Scope;
 use crate::handle::ScopeData;
 use std::cell::UnsafeCell;
 use std::ptr::null_mut;
 
-pub trait Trace {
-    /// # Safety
+/// Implementations of this trait should be derived using the `trace` attribute macro if possible.
+pub trait Trace: 'static {
+    /// ## Safety
     /// The implementation _must_ trace all interior references.
     unsafe fn trace(&self);
 }
 
 pub struct Gc {
-    scope_data: UnsafeCell<ScopeData>,
-    allocator: UnsafeCell<Allocator>,
+    pub(crate) scope_data: UnsafeCell<ScopeData>,
+    pub(crate) allocator: UnsafeCell<Allocator>,
 }
 
 impl Gc {
@@ -25,19 +25,7 @@ impl Gc {
     }
 
     #[inline]
-    pub fn scope<'ctx, F>(&'ctx self, f: F)
-    where
-        F: for<'id> FnOnce(&'id Scope<'ctx>),
-    {
-        unsafe {
-            assert_eq!((*self.scope_data.get()).level, 0);
-            let scope = Scope::new(self.scope_data.get(), self.allocator.get());
-            f(&scope);
-        }
-    }
-
-    #[inline]
-    pub fn collect(&self) {
+    pub fn collect(&mut self) {
         gc(self.scope_data.get(), self.allocator.get())
     }
 }
@@ -92,31 +80,12 @@ fn mark(scope_data: *mut ScopeData) {
     debug!("mark phase");
 
     unsafe {
-        // trace all roots
-        // for us that's only live handles
-        let scope_data = &*scope_data;
-        'iter: for block in &scope_data.blocks {
-            debug!(
-                "live handles: {handles:?}",
-                handles = block
-                    .as_slice()
-                    .iter()
-                    .take_while(|&handle| !std::ptr::addr_eq(handle, scope_data.next))
-                    .map(|handle| (DebugPtr(handle), DebugPtr(*handle)))
-                    .collect::<Vec<_>>()
-            );
-            for handle in block.as_slice().iter() {
-                if std::ptr::addr_eq(handle, scope_data.next) {
-                    break 'iter;
-                }
-
-                if (*handle).is_null() {
-                    continue;
-                }
-
-                debug!("visit handle {handle:p}");
-                GcCell::trace(*handle);
+        for cell in (*scope_data).iter() {
+            if cell.is_null() {
+                continue;
             }
+
+            GcCell::trace(cell);
         }
     }
 }
@@ -197,7 +166,11 @@ fn sweep(allocator: *mut Allocator) {
     }
 }
 
-impl<'gc, T: Trace + 'gc> Trace for crate::handle::Heap<'gc, T> {
+impl Trace for () {
+    unsafe fn trace(&self) {}
+}
+
+impl<T: Trace> Trace for crate::handle::Member<T> {
     unsafe fn trace(&self) {
         GcCell::trace(GcCell::erase(self.ptr).cast_const())
     }
@@ -220,10 +193,7 @@ impl<T: Trace> Trace for std::cell::RefCell<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle::Heap;
-    use crate::handle::Local;
-    use crate::handle::LocalMut;
-    use crate::handle::TransmuteLifetime;
+    use crate::handle::{EscapeScope, Local, LocalMut, Member, Scope};
     use std::cell::RefCell;
 
     struct Test {
@@ -236,12 +206,10 @@ mod tests {
 
     #[test]
     fn simple() {
-        let cx = Gc::default();
-
-        cx.scope(|s| {
-            let v = s.alloc(Test { value: 100 });
-            assert_eq!(v.value, 100);
-        });
+        let mut cx = Gc::default();
+        let s = &mut Scope::new(&mut cx);
+        let v = Local::new(s, Test { value: 100 });
+        assert_eq!(v.value, 100);
     }
 
     #[test]
@@ -256,24 +224,21 @@ mod tests {
         // null <- A <- B <- C
         //         0    0    0
 
-        let cx = Gc::default();
-
-        cx.scope(|cx| {
-            let a = cx.alloc(Test { value: 200 });
-            let b = cx.alloc(Test { value: 300 });
-            assert_eq!(a.value, 200);
-            assert_eq!(b.value, 300);
-            let c = cx.alloc(Test { value: 400 });
-            assert_eq!(c.value, 400);
-        });
-
-        cx.collect();
+        let mut cx = Gc::default();
+        let s = &mut Scope::new(&mut cx);
+        let a = Local::new(s, Test { value: 100 });
+        let b = Local::new(s, Test { value: 200 });
+        assert_eq!(a.value, 100);
+        assert_eq!(b.value, 200);
+        let c = Local::new(s, Test { value: 300 });
+        assert_eq!(c.value, 300);
+        s.collect();
     }
 
     #[test]
     fn mark_and_sweep_1() {
         // don't automatically trigger GC in this case
-        let cx = Gc::new(Config::default().stress(false));
+        let mut cx = Gc::new(Config::default().stress(false));
 
         // null <- A <- B <- C <- D <- E <- F
         //         1    0    1    0    0    1
@@ -288,39 +253,31 @@ mod tests {
         // null <- A <- C <- F
         //         0    0    0
 
-        cx.scope(|cx| {
-            let a = cx.alloc(Test { value: 100 });
-
-            cx.scope(|cx| {
-                cx.alloc(Test { value: 200 });
-            });
-
-            let c = cx.alloc(Test { value: 300 });
-
-            cx.scope(|cx| {
-                let d = cx.alloc(Test { value: 400 });
-                _ = d;
-            });
-
-            cx.scope(|cx| {
-                let e = cx.alloc(Test { value: 500 });
-                _ = e;
-            });
-
-            let f = cx.alloc(Test { value: 600 });
-
-            assert_eq!(a.value + c.value + f.value, 1000);
-
-            // run the GC while A, C, F are live
-            cx.collect();
-        });
+        let s = &mut Scope::new(&mut cx);
+        let a = Local::new(s, Test { value: 100 });
+        {
+            let s = &mut Scope::new(s);
+            let _ = Local::new(s, Test { value: 200 });
+        }
+        let c = Local::new(s, Test { value: 300 });
+        {
+            let s = &mut Scope::new(s);
+            let _ = Local::new(s, Test { value: 400 });
+        }
+        {
+            let s = &mut Scope::new(s);
+            let _ = Local::new(s, Test { value: 500 });
+        }
+        let f = Local::new(s, Test { value: 600 });
+        assert_eq!(a.value + c.value + f.value, 1000);
+        s.collect();
     }
 
-    struct Compound<'gc> {
-        data: Heap<'gc, Test>,
+    struct Compound {
+        data: Member<Test>,
     }
 
-    impl<'gc> Trace for Compound<'gc> {
+    impl Trace for Compound {
         unsafe fn trace(&self) {
             self.data.trace()
         }
@@ -329,75 +286,75 @@ mod tests {
     #[test]
     fn mark_and_sweep_2() {
         // don't automatically trigger GC in this case
-        let cx = Gc::new(Config::default().stress(false));
+        let mut cx = Gc::new(Config::default().stress(false));
 
-        cx.scope(|cx| {
-            // gc...
+        let s = &mut Scope::new(&mut cx);
+        let data = Local::new(s, Test { value: 100 }).to_member();
+        let v = Local::new(s, Compound { data });
 
-            let data = cx.alloc(Test { value: 100 }).to_heap();
-            let v = cx.alloc(Compound { data });
-
-            let data = v.data.to_local(cx);
-            assert_eq!(data.value, 100);
-        })
+        let data = unsafe { v.data.in_scope(s) };
+        assert_eq!(data.value, 100);
     }
 
     thread_local! {
         static COLLECTED_NODES: RefCell<Vec<u32>> = const { RefCell::new(vec![]) };
     }
 
-    struct Node<'gc> {
-        prev: RefCell<Option<Heap<'gc, Node<'gc>>>>,
-        next: RefCell<Option<Heap<'gc, Node<'gc>>>>,
+    struct Node {
+        prev: RefCell<Option<Member<Node>>>,
+        next: RefCell<Option<Member<Node>>>,
         value: u32,
     }
 
-    impl<'gc> Node<'gc> {
-        fn new(cx: &'gc Scope<'_>, value: u32) -> Local<'gc, Node<'gc>> {
-            cx.alloc(Node {
-                prev: RefCell::new(None),
-                next: RefCell::new(None),
-                value,
-            })
+    impl Node {
+        fn new<'a>(s: &mut Scope<'a>, value: u32) -> Local<'a, Node> {
+            Local::new(
+                s,
+                Node {
+                    prev: RefCell::new(None),
+                    next: RefCell::new(None),
+                    value,
+                },
+            )
         }
     }
 
-    impl<'gc> Trace for Node<'gc> {
+    impl Trace for Node {
         unsafe fn trace(&self) {
             self.prev.trace();
             self.next.trace();
         }
     }
 
-    unsafe impl<'gc> TransmuteLifetime for Node<'gc> {
-        type Output<'a> = Node<'a>;
-    }
-
-    impl<'gc> Drop for Node<'gc> {
+    impl Drop for Node {
         fn drop(&mut self) {
             COLLECTED_NODES.with_borrow_mut(|v| v.push(self.value));
         }
     }
 
-    fn node_join<'gc>(left: Local<'gc, Node<'gc>>, right: Local<'gc, Node<'gc>>) {
-        *left.next.borrow_mut() = Some(right.to_heap());
-        *right.prev.borrow_mut() = Some(left.to_heap());
+    fn node_join<'a>(left: Local<'a, Node>, right: Local<'a, Node>) {
+        *left.next.borrow_mut() = Some(right.to_member());
+        *right.prev.borrow_mut() = Some(left.to_member());
     }
 
-    fn node_rotate_right<'gc>(node: &mut LocalMut<'gc, Node<'gc>>) -> bool {
+    fn node_rotate_right(node: &mut LocalMut<'_, Node>) -> bool {
         let next = *node.next.borrow();
         if let Some(next) = next {
-            next.move_to(node);
+            unsafe {
+                next.move_to(node);
+            }
             true
         } else {
             false
         }
     }
 
-    fn node_rotate_left<'gc>(node: &mut LocalMut<'gc, Node<'gc>>) -> bool {
+    fn node_rotate_left(node: &mut LocalMut<'_, Node>) -> bool {
         let prev = *node.prev.borrow();
         if let Some(prev) = prev {
-            prev.move_to(node);
+            unsafe {
+                prev.move_to(node);
+            }
             true
         } else {
             false
@@ -406,93 +363,70 @@ mod tests {
 
     #[test]
     fn escape_value() {
-        let cx = Gc::default();
+        let mut cx = Gc::default();
 
-        cx.scope(|cx| {
-            let node = cx.escape(|cx| Node::new(cx, 1));
+        let outer = &mut Scope::new(&mut cx);
+        let node: Local<Node> = {
+            let inner = &mut EscapeScope::new(outer);
+            let node = Node::new(inner, 1);
+            inner.escape(node)
+        };
 
-            cx.collect();
-
-            assert_eq!(node.value, 100);
-        });
+        outer.collect();
+        assert_eq!(node.value, 100);
     }
 
     #[test]
     fn doubly_linked_list() {
         COLLECTED_NODES.with_borrow_mut(|v| v.clear());
 
-        let cx = Gc::default();
+        let mut cx = Gc::default();
 
-        cx.scope(|cx| {
-            // 1 <-> 2 <-> 3 <-> 4
-            let mut root = cx.empty_slot();
-            cx.scope(|cx| {
-                let one = Node::new(cx, 1);
-                let two = Node::new(cx, 2);
-                let three = Node::new(cx, 3);
-                let four = Node::new(cx, 4);
+        let s = &mut Scope::new(&mut cx);
 
-                node_join(one, two);
-                node_join(two, three);
-                node_join(three, four);
+        let root = {
+            let s = &mut EscapeScope::new(s);
+            let one = Node::new(s, 1);
+            let two = Node::new(s, 2);
+            let three = Node::new(s, 3);
+            let four = Node::new(s, 4);
 
-                root.set(one);
-            });
-            let root = root.get().unwrap();
+            node_join(one, two);
+            node_join(two, three);
+            node_join(three, four);
 
-            // check that we can traverse the linked list in both directions
-            cx.scope(|cx| {
-                // TODO: allow reusing the same local slot
-                let mut root = root.in_scope_mut(cx);
-                for i in 1..=4 {
-                    assert_eq!(root.value, i);
-                    node_rotate_right(&mut root);
-                }
-                for i in (1..=4).rev() {
-                    assert_eq!(root.value, i);
-                    node_rotate_left(&mut root);
-                }
-            });
+            s.escape(one)
+        };
 
-            // make the list circular, and remove reference to `4`
-            cx.scope(|cx| {
-                // from:
-                //     1 <-> 2 <-> 3 <-> 4
-                // to:
-                // +-> 1 <-> 2 <-> 3 <-+ 4
-                // |___________________|
+        // check that we can traverse the linked list in both directions
+        {
+            let s = &mut Scope::new(s);
+            let mut root = root.in_scope_mut(s);
+            for i in 1..=4 {
+                assert_eq!(root.value, i);
+                assert!(node_rotate_right(&mut root));
+            }
+            for i in (1..=4).rev() {
+                assert_eq!(root.value, i);
+                assert!(node_rotate_left(&mut root));
+            }
+        }
 
-                let one = root.in_scope(cx);
-                let two = one.next.borrow().unwrap().to_local(cx);
-                let three = two.next.borrow().unwrap().to_local(cx);
+        // make the list circular, and remove the reference to `4`
+        {
+            // from:
+            //     1 <-> 2 <-> 3 <-> 4
+            // to:
+            // +-> 1 <-> 2 <-> 3 <-+ 4
+            // |___________________|
+
+            let s = &mut Scope::new(s);
+            let one = root.in_scope(s);
+            unsafe {
+                let two = one.next.borrow().unwrap().in_scope(s);
+                let three = two.next.borrow().unwrap().in_scope(s);
                 node_join(three, one);
-            });
-
-            // `4` is now unreachable, and will be collected during the next GC:
-            cx.collect();
-
-            assert!(COLLECTED_NODES.with_borrow(|v| v == &[4]));
-
-            // rotating through a circular list will yield the same values N times:
-            cx.scope(|cx| {
-                let mut root = root.in_scope_mut(cx);
-                for _ in 0..2 {
-                    for i in 1..=3 {
-                        assert_eq!(root.value, i);
-                        assert!(node_rotate_right(&mut root));
-                    }
-                }
-            })
-        });
+            }
+        }
     }
-
-    /* fn _test_compile_fail() {
-        let cx = Gc::default();
-
-        let mut out: Local<'_, Test> = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        cx.scope(|cx| {
-            out = cx.alloc(Test { value: 100 });
-            cx.scope(|cx| {})
-        })
-    } */
 }
