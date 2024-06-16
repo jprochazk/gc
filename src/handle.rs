@@ -40,6 +40,10 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ptr::null_mut;
 
+// TODO: `project!` macro for safe access of `Member` fields through `Local`
+// TODO: Cell-like types with write barries for interior mutability of reference fields
+//       e.g. MemberMut<T> with `set` method that calls the write barrier
+//       see `gc-arena` for how they do field projections and write barriers
 // TODO: add `Global<T>` type, which is a reference-counted handle
 
 // Surely pages are at least 4kB!
