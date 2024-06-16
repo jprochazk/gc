@@ -31,3 +31,7 @@ macro_rules! debug {
 pub mod alloc;
 pub mod gc;
 pub mod handle;
+
+pub(crate) fn default<T: Default>() -> T {
+    T::default()
+}

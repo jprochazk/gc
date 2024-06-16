@@ -74,19 +74,22 @@ impl Default for Config {
 pub(crate) fn gc(scope_data: *mut ScopeData, allocator: *mut Allocator) {
     mark(scope_data);
     sweep(allocator);
+
+    unsafe {
+        (*scope_data).free_unused_blocks();
+    }
 }
 
 fn mark(scope_data: *mut ScopeData) {
     debug!("mark phase");
 
-    unsafe {
-        for cell in (*scope_data).iter() {
-            if cell.is_null() {
-                continue;
-            }
-
-            GcCell::trace(cell);
+    let scope_data = unsafe { &mut *scope_data };
+    for cell in scope_data.iter() {
+        if cell.is_null() {
+            continue;
         }
+
+        unsafe { GcCell::trace(cell) };
     }
 }
 
