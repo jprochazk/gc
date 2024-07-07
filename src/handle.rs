@@ -47,7 +47,7 @@ use std::ptr::null_mut;
 // TODO: add `Global<T>` type, which is a reference-counted handle
 
 // Surely pages are at least 4kB!
-const BLOCK_SIZE: usize = 4096 / std::mem::size_of::<OpaquePtr>();
+pub(crate) const BLOCK_SIZE: usize = 4096 / std::mem::size_of::<OpaquePtr>();
 
 type Ptr<T> = *mut GcCell<T>;
 type OpaquePtr = Ptr<Data>;
@@ -57,59 +57,6 @@ type BlockList = Vec<Box<Block>>;
 
 type Invariant<'a, T = ()> = PhantomData<fn(&'a T) -> &'a T>;
 type Covariant<'a, T = ()> = PhantomData<&'a T>;
-
-pub trait Object: Sized + 'static {}
-
-/*
-TODO: zombie scopes
-
-currently, users could run into use-after-frees:
-
-```
-let parent = &mut Scope::new(...);
-let value = {
-    let child = &mut Scope::new(parent);
-    Local::new(child, ...)
-    // `child` is dropped here
-}
-
-// `value` is still reachable, but it will be freed if we trigger a collection now:
-// this is because `scope_data.next` is reset to `parent.next` when `child` is dropped
-// and `parent.next < value.slot`.
-collect();
-
-// we can still use `value`, but it is now a dangling pointer:
-value.asdf();
-```
-
-to fix this, introduce the concept of a "zombie" scope.
-a zombie scope is a scope that has been dropped, but locals
-within it are still considered reachable.
-*/
-
-/*
-every block is independent so that we have address stability
-the way blocks are currently allocated is fine
-  - the way they are DEallocated may not be fine
-
-store block _index_ AND current bump ptr into the block
-when allocating new block, increment index, set ptr to start of block
-when allocating new handle, maybe alloc new block, and bump ptr
-
-on scope init, store the prev `next` bump. don't need to store limit
-on scope drop, set current `next` as tombstone, then restore prev `next`.
-  do not deallocate any blocks, that's left for GC.
-
-when GC runs, it iterates over scope data. to do so, it must know when to stop.
-to find the last live handle:
-- if `tombstone.index == next.index`, then take `max(tombstone.ptr, next.ptr)`.
-- if `tombstone.index > next.index`, then take `tombstone.ptr`.
-- if `tombstone.index < next.index`, then take `next.ptr`.
-
-after running, it can free unused blocks. to find the last used block,
-take `max(tombstone.index, next.index)`. blocks above may be freed.
-
-*/
 
 #[derive(Clone, Copy)]
 struct Bump {
@@ -143,7 +90,7 @@ pub struct ScopeData {
     ///
     /// Only exists for debug purposes, to assert that
     /// scopes are pushed/popped in the right order.
-    level: usize,
+    next_scope_level: usize,
 
     /// List of allocated blocks.
     ///
@@ -159,7 +106,7 @@ impl ScopeData {
             next: default(),
             tombstone: default(),
             limit: null_mut(),
-            level: 0,
+            next_scope_level: 0,
             blocks: BlockList::new(),
         };
 
@@ -167,23 +114,6 @@ impl ScopeData {
         this.alloc_block();
 
         this
-    }
-
-    pub(crate) fn iter(&self) -> ScopeDataIter {
-        let end = match self.tombstone.index.cmp(&self.next.index) {
-            cmp::Ordering::Equal => cmp::max(self.tombstone.ptr, self.next.ptr),
-            cmp::Ordering::Greater => self.tombstone.ptr,
-            cmp::Ordering::Less => self.next.ptr,
-        };
-
-        ScopeDataIter {
-            scope_data: self,
-            index: 0,
-            next: self.blocks[0].as_ptr(),
-            block_limit: unsafe { self.blocks[0].as_ptr().add(BLOCK_SIZE) },
-            end,
-            lifetime: PhantomData,
-        }
     }
 
     #[inline]
@@ -204,13 +134,12 @@ impl ScopeData {
     #[inline(never)]
     fn alloc_block(&mut self) {
         // Allocate new block
-        let mut new_block = Box::new([null_mut(); BLOCK_SIZE]);
+        self.blocks.push(Box::new([null_mut(); BLOCK_SIZE]));
         self.next = Bump {
-            index: self.blocks.len() as u32,
-            ptr: new_block.as_mut_slice().as_mut_ptr(),
+            index: (self.blocks.len() - 1) as u32,
+            ptr: self.blocks.last_mut().unwrap().as_mut_ptr(),
         };
         self.limit = unsafe { self.next.ptr.add(BLOCK_SIZE) };
-        self.blocks.push(new_block);
 
         debug!(
             "index={}, ptr={:p}, limit={:p}",
@@ -224,11 +153,34 @@ impl ScopeData {
         let last_used_block = cmp::max(self.tombstone.index, self.next.index) as usize;
         drop(self.blocks.drain(last_used_block + 1..));
     }
+
+    pub(crate) fn iter(&self) -> ScopeDataIter {
+        debug!("iter");
+        let end = if self.tombstone.index == self.next.index {
+            debug!("tombstone.index == next.index");
+            cmp::max(self.tombstone.ptr, self.next.ptr)
+        } else if self.tombstone.index < self.next.index {
+            debug!("tombstone.index < next.index");
+            self.next.ptr
+        } else {
+            debug!("tombstone.index > next.index");
+            self.tombstone.ptr
+        };
+
+        ScopeDataIter {
+            scope_data: self,
+            next_block_index: 1,
+            next: self.blocks[0].as_ptr(),
+            block_limit: unsafe { self.blocks[0].as_ptr().add(BLOCK_SIZE) },
+            end,
+            lifetime: PhantomData,
+        }
+    }
 }
 
 pub(crate) struct ScopeDataIter<'a> {
     scope_data: *const ScopeData,
-    index: usize,
+    next_block_index: usize,
     next: *const OpaquePtr,
     block_limit: *const OpaquePtr,
     end: *const OpaquePtr,
@@ -248,21 +200,30 @@ impl Iterator for ScopeDataIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next == self.end {
+            debug!("next=none");
             // at end - no more handles
             None
         } else if self.next == self.block_limit {
+            debug!("next block, next=block[0]");
+
             // at block end - go to next block
             // we are guaranteed to have another block,
             // because we didn't find `self.end` in this one
-            self.index += 1;
-            self.next = self.data().blocks[self.index].as_ptr();
+            self.next = self.data().blocks[self.next_block_index].as_ptr();
+            self.next_block_index += 1;
             self.block_limit = unsafe { self.next.add(BLOCK_SIZE) };
 
             Some(unsafe { *self.next })
         } else {
+            debug!(
+                "next=block[{}]",
+                (self.next as usize - unsafe { self.block_limit.sub(BLOCK_SIZE) } as usize) / 8
+            );
+
             // next handle in current block
+            let next = self.next;
             self.next = unsafe { self.next.add(1) };
-            Some(unsafe { *self.next })
+            Some(unsafe { *next })
         }
     }
 }
@@ -285,10 +246,15 @@ impl<'scope> Scope<'scope> {
 
     pub(crate) unsafe fn new_raw(scope_data: *mut ScopeData, allocator: *mut Allocator) -> Self {
         let prev_next = (*scope_data).next;
-        let level = (*scope_data).level;
-        (*scope_data).level += 1;
+        let level = (*scope_data).next_scope_level;
+        (*scope_data).next_scope_level += 1;
 
-        debug!("prev_next={prev_next:p}, prev_limit={prev_limit:p}, level={level}");
+        debug!(
+            "prev_next={:p}, prev_limit={:p}, level={}",
+            prev_next.ptr,
+            (*scope_data).limit,
+            level
+        );
 
         Scope {
             scope_data,
@@ -302,13 +268,20 @@ impl<'scope> Scope<'scope> {
     /// Trigger a GC cycle.
     #[inline]
     pub fn collect(&mut self) {
+        // TODO: incremental collection
+        self.collect_all()
+    }
+
+    /// Trigger a _full_ GC cycle.
+    #[inline]
+    pub fn collect_all(&mut self) {
         gc(self.scope_data, self.allocator)
     }
 
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         unsafe {
-            let current_level = (*self.scope_data).level;
+            let current_level = (*self.scope_data).next_scope_level;
             current_level == self.level + 1
         }
     }
@@ -321,17 +294,17 @@ impl<'ctx> Drop for Scope<'ctx> {
             let scope_data = self.scope_data;
             (*scope_data).tombstone = (*scope_data).next;
             (*scope_data).next = self.prev_next;
-            (*scope_data).level -= 1;
+            (*scope_data).next_scope_level -= 1;
 
             debug!(
-                "data.tombstone={tombstone:p}, data.next={next:p}, data.level={level}",
-                tombstone = (*scope_data).tombstone,
-                next = (*scope_data).next,
-                level = (*scope_data).level
+                "\n  data.tombstone={tombstone:p}\n  data.next={next:p}\n  data.next_scope_level={level}",
+                tombstone = (*scope_data).tombstone.ptr,
+                next = (*scope_data).next.ptr,
+                level = (*scope_data).next_scope_level
             );
 
             // handle scopes must be created and dropped in stack order
-            assert_eq!((*scope_data).level, self.level);
+            assert_eq!((*scope_data).next_scope_level, self.level);
         }
     }
 }
@@ -470,7 +443,7 @@ impl<T: Trace> Member<T> {
     /// ## Safety
     /// The object must not have been freed yet, and still be reachable.
     #[inline]
-    pub unsafe fn move_to(self, local: &mut LocalMut<'_, T>) {
+    pub unsafe fn move_to(self, local: &mut Local<'_, T>) {
         local.set_raw(self.ptr)
     }
 }
@@ -499,7 +472,7 @@ impl<'scope, T: Trace> Local<'scope, T> {
             // 1. allocate the object on the heap
             let ptr = alloc(scope, value);
             // 2. put it in a fresh handle
-            Local::alloc(scope.scope_data, ptr)
+            Self::alloc(scope.scope_data, ptr)
         }
     }
 
@@ -515,23 +488,33 @@ impl<'scope, T: Trace> Local<'scope, T> {
         }
     }
 
-    pub fn to_member(self) -> Member<T> {
+    pub fn to_member(&self) -> Member<T> {
         unsafe { Member { ptr: *self.slot } }
     }
 
     // TODO: check that you can't leak call this on a scope that has a child scope
-    pub fn in_scope<'a>(self, scope: &mut Scope<'a>) -> Local<'a, T> {
+    pub fn in_scope<'a>(&self, scope: &mut Scope<'a>) -> Local<'a, T> {
         unsafe {
             let ptr = *self.slot;
             Local::alloc(scope.scope_data, ptr)
         }
     }
 
-    pub fn in_scope_mut<'a>(self, scope: &mut Scope<'a>) -> LocalMut<'a, T> {
+    pub fn set(&mut self, other: Local<'_, T>) {
         unsafe {
-            let ptr = *self.slot;
-            LocalMut::alloc(scope.scope_data, ptr)
+            *self.slot = *other.slot;
         }
+    }
+
+    pub(crate) unsafe fn set_raw(&mut self, other: Ptr<T>) {
+        unsafe {
+            *self.slot = other;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn as_ptr(&self) -> *mut Ptr<T> {
+        self.slot
     }
 }
 
@@ -540,97 +523,6 @@ impl<'scope, T: Trace> Deref for Local<'scope, T> {
 
     fn deref(&self) -> &Self::Target {
         unsafe { &*GcCell::data(self.slot.read()) }
-    }
-}
-
-impl<'scope, T: Trace> Clone for Local<'scope, T> {
-    #[allow(clippy::non_canonical_clone_impl)]
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            slot: self.slot,
-            lifetime: PhantomData,
-        }
-    }
-}
-
-impl<'scope, T: Trace> Copy for Local<'scope, T> {}
-
-pub struct LocalMut<'scope, T: Trace> {
-    inner: Local<'scope, T>,
-}
-
-impl<'scope, T: Trace> LocalMut<'scope, T> {
-    pub fn new(scope: &mut Scope<'scope>, value: T) -> Self {
-        Self {
-            inner: Local::new(scope, value),
-        }
-    }
-
-    pub(crate) unsafe fn alloc(scope_data: *mut ScopeData, ptr: Ptr<T>) -> Self {
-        Self {
-            inner: Local::alloc(scope_data, ptr),
-        }
-    }
-
-    pub fn to_local(self) -> Local<'scope, T> {
-        self.inner
-    }
-
-    pub fn set(&mut self, to: Local<'_, T>) {
-        unsafe { self.set_raw(*to.slot) }
-    }
-
-    pub(crate) unsafe fn set_raw(&mut self, ptr: Ptr<T>) {
-        *self.inner.slot = ptr;
-    }
-}
-
-impl<'scope, T: Trace> Deref for LocalMut<'scope, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        self.inner.deref()
-    }
-}
-
-pub struct LocalMutOpt<'scope, T: Trace> {
-    inner: Local<'scope, T>,
-}
-
-impl<'scope, T: Trace> LocalMutOpt<'scope, T> {
-    pub fn new(scope: &mut impl ParentScope<'scope>, value: Option<T>) -> Self {
-        let ptr = match value {
-            Some(value) => alloc(scope, value),
-            None => null_mut(),
-        };
-        Self {
-            inner: unsafe { Local::alloc(scope.scope_data(), ptr) },
-        }
-    }
-
-    pub fn set<V>(&mut self, v: Local<'_, T>) {
-        unsafe {
-            let ptr = *v.slot;
-            self.set_raw(ptr as Ptr<T>)
-        }
-    }
-
-    pub(crate) unsafe fn set_raw(&mut self, v: Ptr<T>) {
-        unsafe {
-            *self.inner.slot = v;
-        }
-    }
-
-    pub fn get(self) -> Option<Local<'scope, T>> {
-        unsafe {
-            let ptr = *self.inner.slot;
-            if ptr.is_null() {
-                return None;
-            }
-
-            Some(self.inner)
-        }
     }
 }
 

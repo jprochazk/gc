@@ -27,7 +27,7 @@ impl Allocator {
         let ptr = Box::into_raw(Box::new(GcCell {
             header: GcHeader {
                 prev: UnsafeCell::new(self.head.get()),
-                vt: Vt::get(&data),
+                vt: Vt::get::<T>(),
                 mark: UnsafeCell::new(false),
             },
             data,
@@ -97,7 +97,7 @@ impl GcCell<Data> {
     #[inline]
     pub(crate) unsafe fn trace(this: *const Self) {
         if Self::is_marked(this) {
-            debug!("marked {:p}", this);
+            debug!("already marked {:p}", this);
             return;
         }
 
@@ -107,13 +107,6 @@ impl GcCell<Data> {
         let vt = (*this).header.vt;
         let data = addr_of!((*this).data) as *const Data;
 
-        #[cfg(not(miri))]
-        {
-            let object = transmute::<TraitObject, *const dyn Trace>(TraitObject { data, vt });
-            (*object).trace();
-        }
-
-        #[cfg(miri)]
         {
             let trace = addr_of!((*vt).trace).read();
             trace(data);
@@ -154,25 +147,16 @@ struct Vt {
     drop_in_place: unsafe fn(*mut Data),
     size: usize,
     align: usize,
-
-    #[cfg(miri)]
     trace: fn(*const Data),
 }
 
 impl Vt {
     #[inline]
-    const fn get<T: Trace>(v: &T) -> *mut Vt {
+    const fn get<T: Trace>() -> *mut Vt {
         // miri won't let us directly access the vtable, but we're willing
         // to accept any risk about its unstable layout.
         // so when running in miri, we use a manually constructed vtable.
 
-        #[cfg(not(miri))]
-        {
-            let v = v as &dyn Trace;
-            unsafe { transmute::<&dyn Trace, TraitObject>(v).vt }
-        }
-
-        #[cfg(miri)]
         {
             trait HasVt<T: ?Sized> {
                 const VT: &'static Vt;
@@ -190,7 +174,6 @@ impl Vt {
                         ),
                         size: size_of::<T>(),
                         align: align_of::<T>(),
-                        #[cfg(miri)]
                         trace: transmute::<unsafe fn(&T), fn(*const Data)>(<T as Trace>::trace),
                     }
                 };
@@ -199,12 +182,6 @@ impl Vt {
             <T as HasVt<T>>::VT as *const _ as *mut _
         }
     }
-}
-
-#[repr(C)]
-struct TraitObject {
-    data: *const Data,
-    vt: *mut Vt,
 }
 
 #[cfg(test)]
