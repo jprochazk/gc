@@ -3,6 +3,12 @@ name = "gc"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+gc_derive.workspace = true
+
 [workspace]
 resolver = "2"
 members = ["gc_derive"]
+
+[workspace.dependencies]
+gc_derive = { path = "gc_derive", version = "*" }

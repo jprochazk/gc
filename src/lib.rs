@@ -2,6 +2,8 @@
 
 extern crate self as gc;
 
+pub use gc_derive::Trace;
+
 #[macro_use]
 mod macros;
 
@@ -14,8 +16,9 @@ use handle::ScopeData;
 use std::cell::UnsafeCell;
 use std::ptr::null_mut;
 
+#[allow(clippy::missing_safety_doc)]
 /// Implementations of this trait should be derived using the `trace` attribute macro if possible.
-pub trait Trace: 'static {
+pub unsafe trait Trace: 'static {
     /// ## Safety
     /// The implementation _must_ trace all interior references.
     unsafe fn trace(&self);
@@ -192,17 +195,13 @@ fn sweep(allocator: *mut Allocator) {
     }
 }
 
-impl Trace for () {
-    unsafe fn trace(&self) {}
-}
-
-impl<T: Trace> Trace for crate::handle::Member<T> {
+unsafe impl<T: Trace> Trace for crate::handle::Member<T> {
     unsafe fn trace(&self) {
         GcCell::trace(GcCell::erase(self.ptr).cast_const())
     }
 }
 
-impl<T: Trace> Trace for Option<T> {
+unsafe impl<T: Trace> Trace for Option<T> {
     unsafe fn trace(&self) {
         if let Some(v) = self {
             v.trace();
@@ -210,11 +209,110 @@ impl<T: Trace> Trace for Option<T> {
     }
 }
 
-impl<T: Trace> Trace for std::cell::RefCell<T> {
+unsafe impl<T: Trace> Trace for std::cell::RefCell<T> {
     unsafe fn trace(&self) {
         self.borrow().trace();
     }
 }
+
+unsafe impl<T: Trace> Trace for &'static T {
+    unsafe fn trace(&self) {
+        (**self).trace();
+    }
+}
+
+macro_rules! impl_null_trace {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            unsafe impl $crate::Trace for $ty {
+                unsafe fn trace(&self) {}
+            }
+        )*
+    }
+}
+
+impl_null_trace! {
+    i8, i16, i32, i64, i128, isize,
+    u8, u16, u32, u64, u128, usize,
+    f32, f64,
+    char,
+    bool,
+    str, String,
+}
+
+macro_rules! impl_trace_collections {
+    ($(
+        $(<$($T:ident),*>)? as ($($v:ident),*) for $ty:ty ;
+    )+) => {
+        $(
+            #[allow(unused_parens)]
+            unsafe impl $(<$($T : $crate::Trace,)*>)? $crate::Trace for $ty {
+                unsafe fn trace(&self) {
+                    for ($($v),*) in self {
+                        $($v.trace();)*
+                    }
+                }
+            }
+        )+
+    }
+}
+
+impl_trace_collections! {
+    <T> as (v) for [T];
+    <T> as (v) for Vec<T>;
+    <T> as (v) for std::collections::VecDeque<T>;
+    <T> as (v) for std::collections::BinaryHeap<T>;
+    <T> as (v) for std::collections::HashSet<T>;
+    <T> as (v) for std::collections::BTreeSet<T>;
+    <K, V> as (k, v) for std::collections::HashMap<K, V>;
+    <K, V> as (k, v) for std::collections::BTreeMap<K, V>;
+}
+
+unsafe impl<T: Trace, const N: usize> Trace for [T; N] {
+    unsafe fn trace(&self) {
+        for v in self {
+            v.trace();
+        }
+    }
+}
+
+macro_rules! all_the_tuples {
+    ($macro:ident) => {
+        $macro!();
+        $macro!(A,);
+        $macro!(A, B,);
+        $macro!(A, B, C,);
+        $macro!(A, B, C, D,);
+        $macro!(A, B, C, D, E,);
+        $macro!(A, B, C, D, E, F,);
+        $macro!(A, B, C, D, E, F, G,);
+        $macro!(A, B, C, D, E, F, G, H,);
+        $macro!(A, B, C, D, E, F, G, H, I,);
+        $macro!(A, B, C, D, E, F, G, H, I, J,);
+        $macro!(A, B, C, D, E, F, G, H, I, J, K,);
+        $macro!(A, B, C, D, E, F, G, H, I, J, K, L,);
+        $macro!(A, B, C, D, E, F, G, H, I, J, K, L, M,);
+        $macro!(A, B, C, D, E, F, G, H, I, J, K, L, M, O,);
+        $macro!(A, B, C, D, E, F, G, H, I, J, K, L, M, O, P,);
+        $macro!(A, B, C, D, E, F, G, H, I, J, K, L, M, O, P, Q,);
+    };
+}
+
+macro_rules! impl_trace_tuple {
+    ($($field:ident,)*) => {
+        #[allow(non_snake_case, unused_parens)]
+        unsafe impl<$($field : $crate::Trace,)*> $crate::Trace for ($($field,)*) {
+            unsafe fn trace(&self) {
+                let ($($field,)*) = self;
+                $(
+                    $field.trace();
+                )*
+            }
+        }
+    };
+}
+
+all_the_tuples!(impl_trace_tuple);
 
 #[cfg(test)]
 mod tests {
@@ -229,7 +327,7 @@ mod tests {
         value: u32,
     }
 
-    impl Trace for Test {
+    unsafe impl Trace for Test {
         unsafe fn trace(&self) {}
     }
 
@@ -306,7 +404,7 @@ mod tests {
         data: Member<Test>,
     }
 
-    impl Trace for Compound {
+    unsafe impl Trace for Compound {
         unsafe fn trace(&self) {
             self.data.trace()
         }
@@ -348,7 +446,7 @@ mod tests {
         }
     }
 
-    impl Trace for Node {
+    unsafe impl Trace for Node {
         unsafe fn trace(&self) {
             self.prev.trace();
             self.next.trace();
@@ -553,8 +651,4 @@ mod tests {
 
         COLLECTED_NODES.with_borrow(|v| assert_eq!(v, &[4, 3, 2, 1]));
     }
-}
-
-pub(crate) fn default<T: Default>() -> T {
-    T::default()
 }

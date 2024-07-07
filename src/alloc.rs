@@ -196,7 +196,7 @@ mod tests {
             value: String,
         }
 
-        impl Trace for Test {
+        unsafe impl Trace for Test {
             unsafe fn trace(&self) {}
         }
 
@@ -217,7 +217,7 @@ mod tests {
         static TRACED: AtomicBool = AtomicBool::new(false);
 
         struct Test {}
-        impl Trace for Test {
+        unsafe impl Trace for Test {
             unsafe fn trace(&self) {
                 TRACED.store(true, Ordering::SeqCst);
             }

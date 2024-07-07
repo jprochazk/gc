@@ -31,7 +31,6 @@
 use crate::alloc::Allocator;
 use crate::alloc::Data;
 use crate::alloc::GcCell;
-use crate::default;
 use crate::gc::gc;
 use crate::gc::Trace;
 use std::cmp;
@@ -103,8 +102,8 @@ pub struct ScopeData {
 impl ScopeData {
     pub(crate) fn new() -> Self {
         let mut this = Self {
-            next: default(),
-            tombstone: default(),
+            next: Default::default(),
+            tombstone: Default::default(),
             limit: null_mut(),
             next_scope_level: 0,
             blocks: BlockList::new(),
