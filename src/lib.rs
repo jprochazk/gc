@@ -196,12 +196,14 @@ fn sweep(allocator: *mut Allocator) {
 }
 
 unsafe impl<T: Trace> Trace for crate::handle::Member<T> {
+    #[inline(always)]
     unsafe fn trace(&self) {
         GcCell::trace(GcCell::erase(self.ptr).cast_const())
     }
 }
 
 unsafe impl<T: Trace> Trace for Option<T> {
+    #[inline]
     unsafe fn trace(&self) {
         if let Some(v) = self {
             v.trace();
@@ -210,12 +212,14 @@ unsafe impl<T: Trace> Trace for Option<T> {
 }
 
 unsafe impl<T: Trace> Trace for std::cell::RefCell<T> {
+    #[inline]
     unsafe fn trace(&self) {
         self.borrow().trace();
     }
 }
 
 unsafe impl<T: Trace> Trace for &'static T {
+    #[inline]
     unsafe fn trace(&self) {
         (**self).trace();
     }
@@ -225,6 +229,7 @@ macro_rules! impl_null_trace {
     ($($ty:ty),* $(,)?) => {
         $(
             unsafe impl $crate::Trace for $ty {
+                #[inline(always)]
                 unsafe fn trace(&self) {}
             }
         )*
@@ -247,6 +252,7 @@ macro_rules! impl_trace_collections {
         $(
             #[allow(unused_parens)]
             unsafe impl $(<$($T : $crate::Trace,)*>)? $crate::Trace for $ty {
+                #[inline]
                 unsafe fn trace(&self) {
                     for ($($v),*) in self {
                         $($v.trace();)*
@@ -269,6 +275,7 @@ impl_trace_collections! {
 }
 
 unsafe impl<T: Trace, const N: usize> Trace for [T; N] {
+    #[inline]
     unsafe fn trace(&self) {
         for v in self {
             v.trace();
@@ -302,6 +309,7 @@ macro_rules! impl_trace_tuple {
     ($($field:ident,)*) => {
         #[allow(non_snake_case, unused_parens)]
         unsafe impl<$($field : $crate::Trace,)*> $crate::Trace for ($($field,)*) {
+            #[inline]
             unsafe fn trace(&self) {
                 let ($($field,)*) = self;
                 $(
@@ -323,12 +331,9 @@ mod tests {
     use crate::handle::Scope;
     use std::cell::RefCell;
 
+    #[derive(Trace)]
     struct Test {
         value: u32,
-    }
-
-    unsafe impl Trace for Test {
-        unsafe fn trace(&self) {}
     }
 
     #[test]
@@ -400,14 +405,9 @@ mod tests {
         s.collect();
     }
 
+    #[derive(Trace)]
     struct Compound {
         data: Member<Test>,
-    }
-
-    unsafe impl Trace for Compound {
-        unsafe fn trace(&self) {
-            self.data.trace()
-        }
     }
 
     #[test]
@@ -427,6 +427,7 @@ mod tests {
         static COLLECTED_NODES: RefCell<Vec<u32>> = const { RefCell::new(vec![]) };
     }
 
+    #[derive(Trace)]
     struct Node {
         prev: RefCell<Option<Member<Node>>>,
         next: RefCell<Option<Member<Node>>>,
@@ -443,13 +444,6 @@ mod tests {
                     value,
                 },
             )
-        }
-    }
-
-    unsafe impl Trace for Node {
-        unsafe fn trace(&self) {
-            self.prev.trace();
-            self.next.trace();
         }
     }
 

@@ -1,7 +1,6 @@
+#![allow(dead_code)]
+
 #[derive(gc::Trace)]
 struct Foo {
-    v: i32,
+    v: Vec<u8>,
 }
-
-#[test]
-fn simple() {}
